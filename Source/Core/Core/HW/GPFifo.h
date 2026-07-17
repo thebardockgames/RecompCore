@@ -65,4 +65,11 @@ private:
 // For use from the JIT.
 void UpdateGatherPipe(GPFifoManager& gpfifo);
 void FastCheckGatherPipe(GPFifoManager& gpfifo);
+
+// Optional passive observer of the raw bytes committed to the FIFO (32-byte
+// gather-pipe bursts), for tools that want to decode the GX command stream
+// without participating in dispatch (e.g. ModernGekko's native-renderer
+// scoping work). No-op when unset; does not affect normal FIFO processing.
+using RawFifoObserver = void (*)(const u8* data, size_t size);
+void SetRawFifoObserver(RawFifoObserver observer);
 }  // namespace GPFifo

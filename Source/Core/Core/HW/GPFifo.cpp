@@ -3,6 +3,7 @@
 
 #include "Core/HW/GPFifo.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 
@@ -18,6 +19,16 @@
 
 namespace GPFifo
 {
+namespace
+{
+std::atomic<RawFifoObserver> s_raw_fifo_observer{nullptr};
+}
+
+void SetRawFifoObserver(RawFifoObserver observer)
+{
+  s_raw_fifo_observer.store(observer, std::memory_order_relaxed);
+}
+
 GPFifoManager::GPFifoManager(Core::System& system) : m_system(system)
 {
 }
@@ -95,6 +106,8 @@ void GPFifoManager::UpdateGatherPipe()
     // copy the GatherPipe
     memory.CopyToEmu(processor_interface.m_fifo_cpu_write_pointer, m_gather_pipe + processed,
                      GATHER_PIPE_SIZE);
+    if (RawFifoObserver observer = s_raw_fifo_observer.load(std::memory_order_relaxed))
+      observer(m_gather_pipe + processed, GATHER_PIPE_SIZE);
     pipe_count -= GATHER_PIPE_SIZE;
 
     // increase the CPUWritePointer
