@@ -339,6 +339,15 @@ void ppc_set_xer_ov(CPUState* cpu, bool ov);
 void ppc_take_exception(CPUState* cpu, u32 exception, u32 vector, u32 srr0, u32 srr1_info);
 void ppc_program_exception(CPUState* cpu, u32 cause, u32 cia);
 
+/* Generic mfspr/mtspr dispatch used by generated code for every SPR number
+ * (DolRecomp's non-inlining codegen path routes all mfspr/mtspr through
+ * these instead of inlining known ones). Known architectural SPRs map to
+ * their named CPUState fields; everything else falls back to the spr[]
+ * scratch array (or raises an illegal-instruction exception if that SPR
+ * isn't in the allow-list). */
+u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia);
+void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia);
+
 /* Gekko lazy FP: generated FPU instructions call this first. Returns true
  * when MSR[FP] is set; otherwise raises the FP-unavailable exception (srr0 =
  * cia so the instruction retries after the OS restores the FP context) and

@@ -24,9 +24,69 @@
  * offset (into cpu->ram) about to be written, `size` the width in bytes. */
 PPCMemWriteJournal g_mem_write_journal = NULL;
 void* g_mem_write_journal_user = NULL;
-__attribute__((visibility("default"))) void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user) {
+#if defined(_MSC_VER)
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user) {
     g_mem_write_journal = fn;
     g_mem_write_journal_user = user;
+}
+
+/* Generic scratch backing store for SPRs that generated code reads/writes
+ * but that don't need modeled hardware behavior (WPAR, HID0/1/4/5, L2CR,
+ * ICTC, THRM1-3, performance monitor regs, etc). Kept out of CPUState
+ * itself since that struct's layout is a fixed ABI mirrored in
+ * include/moderngekko/cpu_state.h; growing it would require updating both
+ * copies in lockstep everywhere they're compiled. */
+static u32 g_generic_spr_storage[1024];
+
+u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia) {
+    switch (spr) {
+    case 1: return cpu->xer;
+    case 8: return cpu->lr;
+    case 9: return cpu->ctr;
+    case 18: return cpu->dsisr;
+    case 19: return cpu->dar;
+    case 26: return cpu->srr0;
+    case 27: return cpu->srr1;
+    case 282: return cpu->ear;
+    case 912: case 913: case 914: case 915:
+    case 916: case 917: case 918: case 919:
+        return cpu->gqr[spr - 912];
+    case 920: return cpu->hid2;
+    default:
+        /* Every other SPR (WPAR, HID0/1/4/5, L2CR, ICTC, THRM1-3,
+         * performance monitor regs, etc.) is treated as generic scratch
+         * storage: real hardware fidelity for these isn't needed to run
+         * the game, and refusing them with an illegal-instruction
+         * exception would just crash boot instead. */
+        return g_generic_spr_storage[spr];
+    }
+}
+
+void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
+    switch (spr) {
+    case 1: cpu->xer = value; return;
+    case 8: cpu->lr = value; return;
+    case 9: cpu->ctr = value; return;
+    case 18: cpu->dsisr = value; return;
+    case 19: cpu->dar = value; return;
+    case 26: cpu->srr0 = value; return;
+    case 27: cpu->srr1 = value; return;
+    case 282: cpu->ear = value; return;
+    case 284: cpu->timebase = (cpu->timebase & 0xFFFFFFFF00000000ull) | value; return;
+    case 285: cpu->timebase = ((u64)value << 32) | (cpu->timebase & 0xFFFFFFFFull); return;
+    case 912: case 913: case 914: case 915:
+    case 916: case 917: case 918: case 919:
+        cpu->gqr[spr - 912] = value;
+        return;
+    case 920: cpu->hid2 = value; return;
+    default:
+        g_generic_spr_storage[spr] = value;
+        return;
+    }
 }
 
 bool cpu_init(CPUState* cpu) {
