@@ -27,6 +27,7 @@
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/DataReader.h"
 #include "VideoCommon/FramebufferManager.h"
+#include "VideoCommon/NativeGXBridge.h"
 #include "VideoCommon/OpcodeDecoding.h"
 #include "VideoCommon/VertexLoaderManager.h"
 #include "VideoCommon/VertexManagerBase.h"
@@ -340,8 +341,17 @@ void FifoManager::RunGpuLoop()
                        distance);
 
             u8* write_ptr = m_video_buffer_write_ptr;
-            m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
-                DataReader(m_video_buffer_read_ptr, write_ptr), &cyclesExecuted);
+            if (NativeGXBridge::OwnsGpu())
+            {
+              m_video_buffer_read_ptr += NativeGXBridge::RunFifo(
+                  m_video_buffer_read_ptr, static_cast<u32>(write_ptr - m_video_buffer_read_ptr),
+                  &cyclesExecuted);
+            }
+            else
+            {
+              m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
+                  DataReader(m_video_buffer_read_ptr, write_ptr), &cyclesExecuted);
+            }
 
             fifo.CPReadPointer.store(readPtr, std::memory_order_relaxed);
             fifo.CPReadWriteDistance.fetch_sub(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
@@ -457,8 +467,17 @@ int FifoManager::RunGpuOnCpu(int ticks)
       }
       ReadDataFromFifo(fifo.CPReadPointer.load(std::memory_order_relaxed));
       u32 cycles = 0;
-      m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
-          DataReader(m_video_buffer_read_ptr, m_video_buffer_write_ptr), &cycles);
+      if (NativeGXBridge::OwnsGpu())
+      {
+        m_video_buffer_read_ptr += NativeGXBridge::RunFifo(
+            m_video_buffer_read_ptr, static_cast<u32>(m_video_buffer_write_ptr - m_video_buffer_read_ptr),
+            &cycles);
+      }
+      else
+      {
+        m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
+            DataReader(m_video_buffer_read_ptr, m_video_buffer_write_ptr), &cycles);
+      }
       available_ticks -= cycles;
     }
 

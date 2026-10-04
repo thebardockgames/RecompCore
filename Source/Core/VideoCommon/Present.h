@@ -39,6 +39,10 @@ public:
               TimePoint presentation_time);
   void ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height);
 
+  // Frame interpolation: the cache entry at xfb_addr holds an extra image for
+  // the first VI field; `real` is presented on the next field showing xfb_addr.
+  void SetPendingXFB(u32 xfb_addr, RcTcacheEntry real, const MathUtil::Rectangle<int>& rect);
+
   void SetNextSwapEstimatedTime(u64 ticks, TimePoint host_time);
 
   void Present(PresentInfo* present_info = nullptr);
@@ -152,6 +156,9 @@ private:
   u32 m_auto_resolution_scale = 1;
 
   RcTcacheEntry m_xfb_entry;
+  RcTcacheEntry m_pending_xfb_entry;
+  u32 m_pending_xfb_addr = 0;
+  MathUtil::Rectangle<int> m_pending_xfb_rect;
   // Internal resolution multiplier scaled XFB size
   MathUtil::Rectangle<int> m_xfb_rect{0, 0, MAX_XFB_WIDTH, MAX_XFB_HEIGHT};
 
@@ -186,6 +193,10 @@ private:
 
   // Used by the SmoothEarlyPresentation setting.
   DT m_presentation_time_offset{};
+  // Frame interpolation: raw lateness of the recent presents (see
+  // GetUpdatedPresentationTime).
+  std::array<DT, 16> m_recent_lateness{};
+  u32 m_recent_lateness_index = 0;
 
   // Calculated from the previous swap time and current refresh rate.
   // Can be used for presentation of ImmediateXFB swaps which don't have timing information.

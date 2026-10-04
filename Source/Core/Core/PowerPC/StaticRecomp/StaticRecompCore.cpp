@@ -4,6 +4,7 @@
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "Common/Config/Config.h"
@@ -14,6 +15,7 @@
 #include "Core/Config/StaticRecompSettings.h"
 #include "Core/Config/ConfigManager.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeSdk.h"
 #include "Core/System.h"
 
 #ifdef _M_X86_64
@@ -109,13 +111,23 @@ void StaticRecompCore::Init()
 
   LoadModule();
   m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
+  std::fprintf(stderr, "[staticrecomp] configured idle pc: 0x%08x\n", m_idle_pc);
+  if (const char* path = std::getenv("MODERNGEKKO_NATIVE_CPU_PC_PROFILE"))
+    m_native_pc_profile_path = path;
+  if (std::getenv("MODERNGEKKO_NATIVE_CPU_PC_PROFILE_EVERY"))
+    m_native_pc_profile_mask = 0;
+  m_native_copy_enabled = std::getenv("MODERNGEKKO_NATIVE_COPY_DISABLE") == nullptr;
+  m_native_branch_batching = std::getenv("MODERNGEKKO_NATIVE_DISABLE_BRANCH_BATCH") == nullptr;
   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
   m_lockstep_verifier->Init();
 
+  const bool disable_jit_fallback = std::getenv("MODERNGEKKO_STATICRECOMP_NO_JIT") != nullptr;
 #ifdef _M_ARM_64
-  m_fallback_jit = std::make_unique<JitArm64>(m_system);
+  if (!disable_jit_fallback)
+    m_fallback_jit = std::make_unique<JitArm64>(m_system);
 #elif defined(_M_X86_64)
-  m_fallback_jit = std::make_unique<Jit64>(m_system);
+  if (!disable_jit_fallback)
+    m_fallback_jit = std::make_unique<Jit64>(m_system);
 #endif
   if (m_fallback_jit)
     m_fallback_jit->Init();
@@ -123,14 +135,56 @@ void StaticRecompCore::Init()
 
 void StaticRecompCore::Shutdown()
 {
+  if (!m_native_pc_profile_path.empty())
+  {
+    if (auto* file = std::fopen(m_native_pc_profile_path.c_str(), "wb"))
+    {
+      std::fprintf(file, "pc,samples\n");
+      for (const auto& [pc, count] : m_native_pc_samples)
+        std::fprintf(file, "%08x,%llu\n", pc, static_cast<unsigned long long>(count));
+      std::fclose(file);
+    }
+    const std::string fallback_path = m_native_pc_profile_path + ".fallback.csv";
+    if (auto* file = std::fopen(fallback_path.c_str(), "wb"))
+    {
+      std::fprintf(file, "kind,pc,instructions\n");
+      for (const auto& [pc, count] : m_native_fallback_samples)
+        std::fprintf(file, "uncovered,%08x,%llu\n", pc, static_cast<unsigned long long>(count));
+      for (const auto& [pc, count] : m_native_hook_samples)
+        std::fprintf(file, "hook,%08x,%llu\n", pc, static_cast<unsigned long long>(count));
+      std::fclose(file);
+    }
+  }
   g_static_recomp_core = nullptr;
+  if (m_native_sdk)
+    m_native_sdk->PrintStats();
+  m_native_sdk.reset();
   std::fprintf(stderr,
                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
-               "smc_failed=%u verifications=%llu reverify_events=%llu\n",
+               "smc_failed=%u verifications=%llu reverify_events=%llu jit_fallback_runs=%llu "
+               "native_kernel_calls=%llu native_cache_instructions=%llu native_cache_batches=%llu "
+               "native_copy_bytes=%llu native_copy_batches=%llu native_copy_enabled=%d "
+               "native_gather_register_instructions=%llu native_scratch_register_instructions=%llu "
+               "native_decrementer_reads=%llu native_decrementer_writes=%llu "
+               "native_dma_register_instructions=%llu native_system_register_instructions=%llu "
+               "branch_batching_enabled=%d\n",
                (unsigned long long)m_native_dispatches, (unsigned long long)m_fallback_steps,
                (unsigned long long)m_native_exceptions,
                (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
-               (unsigned long long)m_verifications, (unsigned long long)m_reverify_events);
+               (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
+               (unsigned long long)m_fallback_jit_runs,
+               (unsigned long long)m_native_kernel_calls,
+               (unsigned long long)m_native_cache_instructions,
+               (unsigned long long)m_native_cache_batches,
+               (unsigned long long)m_native_copy_bytes,
+               (unsigned long long)m_native_copy_batches, m_native_copy_enabled ? 1 : 0,
+               (unsigned long long)m_native_gather_register_instructions,
+               (unsigned long long)m_native_scratch_register_instructions,
+               (unsigned long long)m_native_decrementer_reads,
+               (unsigned long long)m_native_decrementer_writes,
+               (unsigned long long)m_native_dma_register_instructions,
+               (unsigned long long)m_native_system_register_instructions,
+               m_native_branch_batching && m_module && m_module->cpu_abi_version >= 3 ? 1 : 0);
   NOTICE_LOG_FMT(POWERPC,
                  "StaticRecomp: shutdown. native_dispatches={} fallback_steps={} "
                  "native_exceptions={} hook_fallback_instructions={} smc_failed_chunks={} "
@@ -189,12 +243,19 @@ void StaticRecompCore::LoadModule()
     return reject("missing or null " STATICRECOMP_GET_MODULE_SYMBOL);
   if (desc->abi_version != STATICRECOMP_ABI_VERSION)
     return reject(fmt::format("abi_version {} != {}", desc->abi_version, STATICRECOMP_ABI_VERSION));
-  if (desc->cpu_abi_version != GXRUNTIME_CPU_ABI_VERSION)
+  // CPU ABIs only append fields: older modules see an exact prefix (v2 ends
+  // before dispatch_budget, v3 before chunk_state).
+  size_t expected_state_size = sizeof(CPUState);
+  if (desc->cpu_abi_version == 2u)
+    expected_state_size = offsetof(CPUState, dispatch_budget);
+  else if (desc->cpu_abi_version == 3u)
+    expected_state_size = offsetof(CPUState, chunk_state);
+  else if (desc->cpu_abi_version != GXRUNTIME_CPU_ABI_VERSION)
     return reject(fmt::format("cpu_abi_version {} != {}", desc->cpu_abi_version,
                               GXRUNTIME_CPU_ABI_VERSION));
-  if (desc->cpu_state_size != sizeof(CPUState))
-    return reject(fmt::format("cpu_state_size {} != sizeof(CPUState) {}", desc->cpu_state_size,
-                              sizeof(CPUState)));
+  if (desc->cpu_state_size != expected_state_size)
+    return reject(fmt::format("cpu_state_size {} != expected {} for CPU ABI {}",
+                              desc->cpu_state_size, expected_state_size, desc->cpu_abi_version));
   if (!desc->dispatch || !desc->code_ranges || desc->num_code_ranges == 0)
     return reject("no dispatch entry or empty code ranges");
   if (!std::memchr(desc->game_id, '\0', sizeof(desc->game_id)) || desc->game_id[0] == '\0')
@@ -222,6 +283,24 @@ void StaticRecompCore::LoadModule()
 
   std::fprintf(stderr, "[staticrecomp] module loaded: %s entry=0x%08X\n", path.c_str(),
                desc->entry_point);
+  m_native_sdk.reset();
+  using NativeHooksFn = u32 (*)(const u32**, unsigned char**, int**);
+  const auto native_hooks = m_library.IsOpen() ?
+      reinterpret_cast<NativeHooksFn>(m_library.GetSymbolAddress("staticrecomp_native_hooks")) :
+      nullptr;
+  if (native_hooks)
+  {
+    const u32* addresses = nullptr;
+    unsigned char* flags = nullptr;
+    int* any = nullptr;
+    const u32 count = native_hooks(&addresses, &flags, &any);
+    std::fprintf(stderr, "[staticrecomp] module native hooks: %u\n", count);
+    if (count && addresses && flags && any)
+    {
+      m_native_sdk = std::make_unique<StaticRecompNativeSdk::NativeSdk>(m_system);
+      m_native_sdk->Bind(count, addresses, flags, any);
+    }
+  }
   NOTICE_LOG_FMT(POWERPC,
                  "StaticRecomp: loaded module '{}' (game_id={} entry=0x{:08X} "
                  "code_ranges={} smc_ranges={})",

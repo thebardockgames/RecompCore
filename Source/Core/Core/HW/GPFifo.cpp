@@ -106,8 +106,12 @@ void GPFifoManager::UpdateGatherPipe()
     // copy the GatherPipe
     memory.CopyToEmu(processor_interface.m_fifo_cpu_write_pointer, m_gather_pipe + processed,
                      GATHER_PIPE_SIZE);
-    if (RawFifoObserver observer = s_raw_fifo_observer.load(std::memory_order_relaxed))
-      observer(m_gather_pipe + processed, GATHER_PIPE_SIZE);
+    // GX redirects the gather pipe to RAM while constructing display lists.
+    // Those bytes must only be decoded when a later FIFO command calls the
+    // list; observing them here executes the list twice and corrupts GX state.
+    if (system.GetCommandProcessor().GetFifo().bFF_GPLinkEnable.load(std::memory_order_relaxed))
+      if (RawFifoObserver observer = s_raw_fifo_observer.load(std::memory_order_relaxed))
+        observer(m_gather_pipe + processed, GATHER_PIPE_SIZE);
     pipe_count -= GATHER_PIPE_SIZE;
 
     // increase the CPUWritePointer

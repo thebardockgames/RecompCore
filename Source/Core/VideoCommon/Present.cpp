@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/Present.h"
+#include "VideoCommon/FrameInterpolation.h"
 
 #include "Common/ChunkFile.h"
 #include "Core/Config/GraphicsSettings.h"
@@ -168,7 +169,20 @@ bool Presenter::FetchXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_heigh
 void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks,
                        TimePoint presentation_time)
 {
+  if (FrameInterpolation::IsActive())
+    FrameInterpolation::OnViField();
   bool is_duplicate = FetchXFB(xfb_addr, fb_width, fb_stride, fb_height, ticks);
+
+  // Frame interpolation: second field of a frame shows its real image.
+  if (is_duplicate && m_pending_xfb_entry && m_pending_xfb_addr == xfb_addr)
+  {
+    ReleaseXFBContentLock();
+    m_xfb_entry = std::move(m_pending_xfb_entry);
+    m_xfb_rect = m_pending_xfb_rect;
+    m_last_xfb_id = m_xfb_entry->id;
+    m_xfb_entry->AcquireContentLock();
+    is_duplicate = false;
+  }
 
   PresentInfo present_info{
       .present_count = m_present_count++,
@@ -217,6 +231,14 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
 
     video_events.after_present_event.Trigger(present_info);
   }
+}
+
+void Presenter::SetPendingXFB(u32 xfb_addr, RcTcacheEntry real,
+                              const MathUtil::Rectangle<int>& rect)
+{
+  m_pending_xfb_addr = xfb_addr;
+  m_pending_xfb_entry = std::move(real);
+  m_pending_xfb_rect = rect;
 }
 
 void Presenter::ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height)
@@ -985,6 +1007,24 @@ void Presenter::Present(PresentInfo* present_info)
 TimePoint Presenter::GetUpdatedPresentationTime(TimePoint intended_presentation_time)
 {
   const auto now = Clock::now();
+
+  // Frame interpolation renders its extra image just before one of a frame's
+  // two VI fields, so presents arrive with uneven lateness. Present every image
+  // at its intended time plus the largest raw lateness of the recent presents
+  // (capped), i.e. a nearly constant latency with even spacing. Only raw
+  // arrival lateness is remembered, so the wait never feeds back into itself.
+  // In single-core mode this wait also pauses emulation; dual core keeps it on
+  // the video thread.
+  if (FrameInterpolation::IsActive())
+  {
+    constexpr DT max_alignment = std::chrono::milliseconds(10);
+    const DT lateness = std::max(now - intended_presentation_time, DT{});
+    m_recent_lateness[m_recent_lateness_index++ % m_recent_lateness.size()] = lateness;
+    const DT target = std::min(
+        *std::max_element(m_recent_lateness.begin(), m_recent_lateness.end()), max_alignment);
+    return intended_presentation_time + std::max(target, lateness);
+  }
+
   const auto arrival_offset = std::min(now - intended_presentation_time, DT{});
 
   if (!Config::Get(Config::MAIN_SMOOTH_EARLY_PRESENTATION))

@@ -27,7 +27,7 @@
 //   consumes and resets it (Dolphin chassis: per-dispatch flush into
 //   ppc_state.downcount). Hosts that do not meter guest time may ignore it
 //   (s64: it cannot wrap in any realistic session).
-#define GXRUNTIME_CPU_ABI_VERSION 2u
+#define GXRUNTIME_CPU_ABI_VERSION 4u
 #define GXRUNTIME_CPU_ABI_DOLRECOMP_PREFIX 1u
 #define GXRUNTIME_CPU_ABI_EXTERNAL_POINTER_EXTENSION 1u
 
@@ -142,6 +142,12 @@ struct CPUState {
     s64 downcount;
     u8* exram;
     u32 exram_size;
+    // ABI v3 appends a live chassis cycle budget; the ABI v2 prefix is intact.
+    s64 dispatch_budget;
+    // ABI v4 appends the chassis SMC chunk state (1 = verified), indexed like
+    // the module chunk table; native direct calls check it before entering
+    // another chunk. NULL disables direct calls. The ABI v3 prefix is intact.
+    const u8* chunk_state;
 };
 
 #include <stdio.h>
@@ -262,6 +268,141 @@ static GXRUNTIME_ALWAYS_INLINE void mem_write8(CPUState* cpu, u32 addr, u8 value
     }
     if (g_mem_write_journal && offset != (u32)-1) g_mem_write_journal(offset, 1, g_mem_write_journal_user);
     *ptr = value;
+}
+
+/* Paired-single quantized loads and stores (psq_l/psq_st and their indexed and
+ * update forms), inline so generated code specializes each site (register,
+ * w, GQR index, indexed are constants there). Semantics mirror Dolphin's
+ * interpreter, the chassis lockstep oracle, exactly:
+ *  - psq_l/psq_st (non-indexed) require only HID2.LSQE; the indexed forms
+ *    are never gated. PSE is not checked, and no alignment exceptions are
+ *    raised (unaligned accesses go straight to memory).
+ *  - Invalid GQR types 1-3 load 0.0 into both lanes and store nothing.
+ *  - Dequantization: f32(int) * f32 power-of-two, rounded once to f32.
+ *  - Quantization: round the lane to f32 first, multiply by the f32
+ *    power-of-two scale, clamp in f32, truncate. NaN quantizes to 0
+ *    (matching SType(NaN-after-clamp) in release Dolphin on arm64).
+ * Scales are exact powers of two (-32..31) built in the exponent field: the
+ * values ldexp/ldexpf return. In memory that is not RAM (the locked L1 cache)
+ * both lanes go through one host pointer when the host provides it. */
+void ppc_program_exception(CPUState* cpu, u32 cause, u32 cia);
+
+static GXRUNTIME_ALWAYS_INLINE f64 psq_pow2_f64(s32 e) {
+    const u64 bits = (u64)(1023 + e) << 52;
+    f64 value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static GXRUNTIME_ALWAYS_INLINE f32 psq_pow2_f32(s32 e) {
+    const u32 bits = (u32)(127 + e) << 23;
+    f32 value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static GXRUNTIME_ALWAYS_INLINE u32 psq_type_size(u8 type) {
+    return type == 0 ? 4u : (type == 4 || type == 6) ? 1u : (type == 5 || type == 7) ? 2u : 0u;
+}
+
+static GXRUNTIME_ALWAYS_INLINE f64 psq_dequant(f64 value, s32 scale) {
+    /* value is an integer below 2^16: scaling by 2^-scale is exact in f64. */
+    return scale == 0 ? (f64)(f32)value : (f64)(f32)(value * psq_pow2_f64(-scale));
+}
+
+static GXRUNTIME_ALWAYS_INLINE s64 psq_quantize_int(f64 value, s64 min_value, s64 max_value, s32 scale) {
+    const f32 conv = (f32)value * psq_pow2_f32(scale);
+    if (conv != conv)
+        return 0;
+    if (conv <= (f32)min_value)
+        return min_value;
+    if (conv >= (f32)max_value)
+        return max_value;
+    return (s64)conv;
+}
+
+static GXRUNTIME_ALWAYS_INLINE f64 psq_from_raw(u32 raw, u8 type, s32 scale) {
+    switch (type) {
+    case 0: return f64_value(convert_to_double(raw));
+    case 4: return psq_dequant((f64)(u8)raw, scale);
+    case 5: return psq_dequant((f64)(u16)raw, scale);
+    case 6: return psq_dequant((f64)(s8)(u8)raw, scale);
+    default: return psq_dequant((f64)(s16)(u16)raw, scale);
+    }
+}
+
+static GXRUNTIME_ALWAYS_INLINE u32 psq_to_raw(f64 value, u8 type, s32 scale) {
+    switch (type) {
+    case 0: return convert_to_single_ftz(f64_bits(value));
+    case 4: return (u32)(u8)psq_quantize_int(value, 0, 255, scale);
+    case 5: return (u32)(u16)psq_quantize_int(value, 0, 65535, scale);
+    case 6: return (u32)(u8)(s8)psq_quantize_int(value, -128, 127, scale);
+    default: return (u32)(u16)(s16)psq_quantize_int(value, -32768, 32767, scale);
+    }
+}
+
+static GXRUNTIME_ALWAYS_INLINE u32 psq_read_raw(CPUState* cpu, const u8* direct, u32 ea, u32 size) {
+    if (direct)
+        return size == 4 ? read_be32(direct) : size == 2 ? read_be16(direct) : direct[0];
+    return size == 4 ? mem_read32(cpu, ea) : size == 2 ? mem_read16(cpu, ea) : mem_read8(cpu, ea);
+}
+
+static GXRUNTIME_ALWAYS_INLINE void psq_write_raw(CPUState* cpu, u8* direct, u32 ea, u32 size, u32 raw) {
+    if (direct) {
+        if (size == 4) write_be32(direct, raw);
+        else if (size == 2) write_be16(direct, (u16)raw);
+        else direct[0] = (u8)raw;
+        return;
+    }
+    if (size == 4) mem_write32(cpu, ea, raw);
+    else if (size == 2) mem_write16(cpu, ea, (u16)raw);
+    else mem_write8(cpu, ea, (u8)raw);
+}
+
+static GXRUNTIME_ALWAYS_INLINE u8* psq_direct(CPUState* cpu, u32 ea, u32 bytes) {
+    if (get_ram_ptr(cpu, ea, bytes, NULL) || !cpu->external_pointer)
+        return NULL;
+    return (u8*)cpu->external_pointer(cpu, ea, bytes);
+}
+
+static GXRUNTIME_ALWAYS_INLINE bool ppc_psq_load_inline(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr_index,
+                                                        bool indexed, u32 cia) {
+    if (!indexed && (cpu->hid2 & PPC_HID2_LSQE) == 0) {
+        ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
+        return false;
+    }
+    const u32 gqr = cpu->gqr[gqr_index & 7u];
+    const s32 scale = sign_extend((gqr >> 24) & 0x3Fu, 6);
+    const u8 type = (u8)((gqr >> 16) & 7u);
+    const u32 size = psq_type_size(type);
+    if (size == 0) { /* invalid GQR type: both lanes read as 0.0 */
+        cpu->fpr[frD] = 0.0;
+        cpu->ps1[frD] = 0.0;
+        return true;
+    }
+    const u8* direct = psq_direct(cpu, ea, w ? size : size * 2);
+    cpu->fpr[frD] = psq_from_raw(psq_read_raw(cpu, direct, ea, size), type, scale);
+    cpu->ps1[frD] = w ? 1.0 : psq_from_raw(psq_read_raw(cpu, direct ? direct + size : NULL, ea + size, size), type, scale);
+    return true;
+}
+
+static GXRUNTIME_ALWAYS_INLINE bool ppc_psq_store_inline(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index,
+                                                         bool indexed, u32 cia) {
+    if (!indexed && (cpu->hid2 & PPC_HID2_LSQE) == 0) {
+        ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
+        return false;
+    }
+    const u32 gqr = cpu->gqr[gqr_index & 7u];
+    const s32 scale = sign_extend((gqr >> 8) & 0x3Fu, 6);
+    const u8 type = (u8)(gqr & 7u);
+    const u32 size = psq_type_size(type);
+    if (size == 0) /* invalid GQR type: nothing is stored */
+        return true;
+    u8* direct = psq_direct(cpu, ea, w ? size : size * 2);
+    psq_write_raw(cpu, direct, ea, size, psq_to_raw(cpu->fpr[frS], type, scale));
+    if (!w)
+        psq_write_raw(cpu, direct ? direct + size : NULL, ea + size, size, psq_to_raw(cpu->ps1[frS], type, scale));
+    return true;
 }
 
 #undef GXRUNTIME_ALWAYS_INLINE

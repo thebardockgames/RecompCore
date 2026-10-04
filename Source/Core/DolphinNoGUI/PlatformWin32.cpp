@@ -79,10 +79,16 @@ bool PlatformWin32::RegisterRenderWindowClass()
 
 bool PlatformWin32::CreateRenderWindow()
 {
+  // Render dimensions describe the client area. CreateWindowEx expects the
+  // outer rectangle; account for the title bar and borders before creating it.
+  RECT bounds{0, 0, m_window_width, m_window_height};
+  if (!AdjustWindowRectEx(&bounds, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_CLIENTEDGE))
+    return false;
   m_hwnd = CreateWindowEx(WS_EX_CLIENTEDGE, WINDOW_CLASS_NAME, _T("Dolphin"), WS_OVERLAPPEDWINDOW,
                           m_window_x < 0 ? CW_USEDEFAULT : m_window_x,
-                          m_window_y < 0 ? CW_USEDEFAULT : m_window_y, m_window_width,
-                          m_window_height, nullptr, nullptr, GetModuleHandle(nullptr), this);
+                          m_window_y < 0 ? CW_USEDEFAULT : m_window_y,
+                          bounds.right - bounds.left, bounds.bottom - bounds.top,
+                          nullptr, nullptr, GetModuleHandle(nullptr), this);
   if (!m_hwnd)
   {
     MessageBox(nullptr, _T("CreateWindowEx failed."), _T("Error"), MB_ICONERROR | MB_OK);

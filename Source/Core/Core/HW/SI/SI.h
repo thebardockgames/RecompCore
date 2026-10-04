@@ -68,6 +68,13 @@ public:
 
   u32 GetPollXLines();
 
+  // Side-effect-free view of the latched input words and status register
+  // (MMIO reads of the input words clear RDST). Used by the StaticRecomp
+  // native SDK verifier to compute from the same data the guest reads.
+  u32 PeekStatus() const { return m_status_reg.hex; }
+  u32 PeekInHi(int channel) const { return m_channel[channel].in_hi.hex; }
+  u32 PeekInLo(int channel) const { return m_channel[channel].in_lo.hex; }
+
   static constexpr u32 BUFFER_SIZE = 128;
 
 private:

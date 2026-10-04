@@ -5,7 +5,10 @@
 #include "Core/System.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/HW/SystemTimers.h"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <xmmintrin.h>
 
 void StaticRecompCore::SetPPCStateFromGuestState(const CPUState& s, PowerPC::PowerPCState& ppc)
 {
@@ -72,6 +75,7 @@ void StaticRecompCore::SyncIn()
   m_guest.exception = 0;
   m_guest.program_exception = 0;
   m_guest.downcount = 0;  // charge accumulator, not a copy of ppc.downcount
+  m_guest.dispatch_budget = 0;  // armed immediately before each native dispatch
 
   if (m_module && m_module->on_state_loaded)
     m_module->on_state_loaded(&m_guest);
@@ -97,6 +101,20 @@ void StaticRecompCore::SyncOut()
     power_pc.MSRUpdated();
   }
   PowerPC::RoundingModeUpdated(ppc);
+  // Diagnostics: MODERNGEKKO_DIAG_FPSCR=1 logs changes of the guest's FPSCR
+  // NI/RN bits; MODERNGEKKO_DIAG_FORCE_FTZ=1 forces host flush-to-zero
+  // (changes results: measurement only, never a game run).
+  static const bool log_fpscr = std::getenv("MODERNGEKKO_DIAG_FPSCR") != nullptr;
+  static const bool force_ftz = std::getenv("MODERNGEKKO_DIAG_FORCE_FTZ") != nullptr;
+  static u32 last_mode = 0xFFFFFFFFu;
+  if (log_fpscr && (ppc.fpscr.Hex & 7u) != last_mode)
+  {
+    last_mode = ppc.fpscr.Hex & 7u;
+    std::fprintf(stderr, "[staticrecomp] guest fpscr NI=%u RN=%u pc=%08x\n", (last_mode >> 2) & 1u, last_mode & 3u,
+                 ppc.pc);
+  }
+  if (force_ftz)
+    _mm_setcsr(_mm_getcsr() | 0x8040u);
 }
 
 void StaticRecompCore::PropagateGuestMSR()

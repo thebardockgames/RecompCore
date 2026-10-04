@@ -106,16 +106,14 @@ static inline f64 f64_value(u64 bits) {
     return value;
 }
 
-static inline u64 convert_to_double(u32 value) {
+/* Subnormal, zero, infinity and NaN inputs of convert_to_double (kept out of
+ * line so the common normal case inlines into generated code). */
+static inline u64 convert_to_double_special(u32 value) {
     u64 x = value;
     u64 exp = (x >> 23) & 0xFFu;
     u64 frac = x & 0x007FFFFFu;
 
-    if (exp > 0 && exp < 255) { /* normal */
-        u64 y = !(exp >> 7);
-        u64 z = (y << 61) | (y << 60) | (y << 59);
-        return ((x & 0xC0000000u) << 32) | z | ((x & 0x3FFFFFFFu) << 29);
-    } else if (exp == 0 && frac != 0) { /* subnormal */
+    if (exp == 0 && frac != 0) { /* subnormal */
         exp = 1023 - 126;
         do {
             frac <<= 1;
@@ -127,6 +125,23 @@ static inline u64 convert_to_double(u32 value) {
         u64 z = (y << 61) | (y << 60) | (y << 59);
         return ((x & 0xC0000000u) << 32) | z | ((x & 0x3FFFFFFFu) << 29);
     }
+}
+
+#if defined(_MSC_VER)
+#define DOLRECOMP_TYPES_FORCEINLINE __forceinline
+#else
+#define DOLRECOMP_TYPES_FORCEINLINE inline __attribute__((always_inline))
+#endif
+
+static DOLRECOMP_TYPES_FORCEINLINE u64 convert_to_double(u32 value) {
+    u64 x = value;
+    u64 exp = (x >> 23) & 0xFFu;
+    if (exp > 0 && exp < 255) { /* normal */
+        u64 y = !(exp >> 7);
+        u64 z = (y << 61) | (y << 60) | (y << 59);
+        return ((x & 0xC0000000u) << 32) | z | ((x & 0x3FFFFFFFu) << 29);
+    }
+    return convert_to_double_special(value);
 }
 
 static inline u32 convert_to_single(u64 x) {

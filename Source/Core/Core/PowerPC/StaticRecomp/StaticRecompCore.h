@@ -30,6 +30,11 @@ namespace StaticRecompLockstep
 class StaticRecompLockstepVerifier;
 }
 
+namespace StaticRecompNativeSdk
+{
+class NativeSdk;
+}
+
 // Executes statically recompiled per-game native code when the PC is covered by
 // a loaded module; falls back to Dolphin's interpreter for everything else.
 // With no module loaded this core is exactly an interpreter loop.
@@ -86,7 +91,7 @@ private:
     void InvalidateICacheInternal(u32 physical_address, u32 address, u32 length,
                                   bool forced) override
     {
-      m_core.OnICacheInvalidate(address, length);
+      m_core.OnICacheInvalidate(address, length, physical_address);
     }
 
   private:
@@ -108,7 +113,7 @@ private:
     CHUNK_FAILED = 2,
   };
 
-  void OnICacheInvalidate(u32 address, u32 length);
+  void OnICacheInvalidate(u32 address, u32 length, u32 physical_address);
   int ChunkIndexOf(u32 address) const;
   void VerifyChunk(u32 index);
 
@@ -131,8 +136,11 @@ private:
   // Keep Dolphin's MSR-derived state (translation mode, feature flags) in step
   // with the guest MSR before any MMU access or exception delivery.
   void PropagateGuestMSR();
+  void RefreshDispatchBudget(CPUState& cpu);
 
   std::unique_ptr<StaticRecompLockstep::StaticRecompLockstepVerifier> m_lockstep_verifier;
+  // Host implementations of SDK functions (modules built with native hooks).
+  std::unique_ptr<StaticRecompNativeSdk::NativeSdk> m_native_sdk;
 
   EmptyBlockCache m_block_cache{*this};
 
@@ -145,8 +153,28 @@ private:
 
   u64 m_native_dispatches = 0;
   u64 m_fallback_steps = 0;
+  u64 m_fallback_jit_runs = 0;
+  u64 m_native_kernel_calls = 0;
+  u64 m_native_cache_instructions = 0;
+  u64 m_native_cache_batches = 0;
+  u64 m_native_copy_bytes = 0;
+  u64 m_native_copy_batches = 0;
+  bool m_native_copy_enabled = true;
+  bool m_native_branch_batching = true;
+  std::string m_native_pc_profile_path;
+  // Dispatch sampling mask: 1023 samples one dispatch in 1024; 0 records every dispatch.
+  u64 m_native_pc_profile_mask = 1023;
+  std::unordered_map<u32, u64> m_native_pc_samples;
+  std::unordered_map<u32, u64> m_native_fallback_samples;
+  std::unordered_map<u32, u64> m_native_hook_samples;
   u64 m_native_exceptions = 0;
   u64 m_hook_fallback_instructions = 0;
+  u64 m_native_gather_register_instructions = 0;
+  u64 m_native_scratch_register_instructions = 0;
+  u64 m_native_decrementer_reads = 0;
+  u64 m_native_decrementer_writes = 0;
+  u64 m_native_dma_register_instructions = 0;
+  u64 m_native_system_register_instructions = 0;
   u64 m_bursts = 0;          // SyncIn..SyncOut native runs (diagnostic)
   u64 m_charged_cycles = 0;  // cycles flushed from module charges (diagnostic)
 

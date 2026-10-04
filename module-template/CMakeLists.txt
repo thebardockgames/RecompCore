@@ -1,6 +1,16 @@
 cmake_minimum_required(VERSION 3.16)
 project(recompcore_module C)
 
+if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
+    set(CMAKE_CL_SHOWINCLUDES_PREFIX "${CMAKE_C_CL_SHOWINCLUDES_PREFIX}")
+    if(CMAKE_CL_SHOWINCLUDES_PREFIX MATCHES "^Nota:")
+        # CMake may decode the UTF-8 accented prefix as the OEM code page.
+        set(CMAKE_CL_SHOWINCLUDES_PREFIX "Nota: inclusión del archivo: ")
+    endif()
+    set(CMAKE_C_COMPILER_LAUNCHER
+        "cmd.exe;/d;/c;${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/msvc-utf8.cmd")
+endif()
+
 # Per-game native module for RecompCore: generated chunks + DolRecomp CPU
 # runtime + ABI export glue, no other host dependencies.
 #
@@ -60,6 +70,12 @@ set_target_properties(${MODULE_NAME} PROPERTIES PREFIX "" OUTPUT_NAME "${MODULE_
 set_source_files_properties("${MODULE_TABLES}" PROPERTIES HEADER_FILE_ONLY TRUE GENERATED TRUE)
 
 target_compile_definitions(${MODULE_NAME} PRIVATE MODULE_GAME_ID="${GAME_ID}")
+
+# Diagnostic-only: count entries of every fast function (see module_export.c).
+option(DOLRECOMP_ENTRY_COUNTERS "Build a diagnostic module with per-function entry counters" OFF)
+if(DOLRECOMP_ENTRY_COUNTERS)
+  target_compile_definitions(${MODULE_NAME} PRIVATE DOLRECOMP_ENTRY_COUNTERS=1)
+endif()
 
 target_include_directories(${MODULE_NAME} PRIVATE
   "${GENERATED_DIR}"

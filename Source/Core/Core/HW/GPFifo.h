@@ -68,6 +68,8 @@ void FastCheckGatherPipe(GPFifoManager& gpfifo);
 
 // Optional passive observer of the raw bytes committed to the FIFO (32-byte
 // gather-pipe bursts), for tools that want to decode the GX command stream
+// while the CPU FIFO is linked to the GPU. Redirected display-list writes
+// to RAM are excluded; they are not GPU submissions.
 // without participating in dispatch (e.g. ModernGekko's native-renderer
 // scoping work). No-op when unset; does not affect normal FIFO processing.
 using RawFifoObserver = void (*)(const u8* data, size_t size);

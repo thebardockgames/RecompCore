@@ -5,6 +5,7 @@
 #include "Core/StateFile.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <locale>
 #include <map>
@@ -284,6 +285,7 @@ static void CompressAndDumpState(Core::System& system, const CompressAndDumpStat
   {
     const std::filesystem::path temp_path(filename);
     Core::DisplayMessage(fmt::format("Saved State to {}", temp_path.filename()), 2000);
+    std::fprintf(stderr, "[savestate] saved=%s\n", filename.c_str());
   }
 }
 
@@ -351,6 +353,8 @@ static void LoadAsFromCore(Core::System& system, std::string filename)
   {
     if (loaded_successfully)
     {
+      std::fprintf(stderr, "[savestate] loaded=%s pc=0x%08x\n", filename.c_str(),
+                   system.GetPPCState().pc);
       const std::filesystem::path temp_filename(filename);
       Core::DisplayMessage(fmt::format("Loaded State from {}", temp_filename.filename()), 2000);
       if (File::Exists(filename + ".dtm"))

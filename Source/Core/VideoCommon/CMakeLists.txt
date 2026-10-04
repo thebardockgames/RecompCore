@@ -126,6 +126,12 @@ add_library(videocommon
   OnScreenUI.cpp
   OnScreenUI.h
   OnScreenUIKeyMap.h
+  FrameInterpolation.cpp
+  FrameInterpolation.h
+  NativeGXBridge.cpp
+  NativeGXBridge.h
+  NativeGXVerify.cpp
+  NativeGXVerify.h
   OpcodeDecoding.cpp
   OpcodeDecoding.h
   PerfQueryBase.cpp

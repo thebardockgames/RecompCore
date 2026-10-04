@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompAddress.h"
 #include "Core/System.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/JitInterface.h"
@@ -11,11 +12,7 @@
 
 int StaticRecompCore::GetAddressLookupIndex(u32 address) const
 {
-  if (address >= 0x80000000u && address < 0x80000000u + m_lookup_ram_size)
-    return static_cast<int>((address - 0x80000000u) >> 2);
-  if (address >= 0x90000000u && address < 0x90000000u + m_lookup_exram_size)
-    return static_cast<int>((m_lookup_ram_size >> 2) + ((address - 0x90000000u) >> 2));
-  return -1;
+  return StaticRecompAddress::LookupIndex(address, m_lookup_ram_size, m_lookup_exram_size);
 }
 
 void StaticRecompCore::InitLookupTable(u32 ram_size, u32 exram_size)
@@ -32,18 +29,18 @@ void StaticRecompCore::InitLookupTable(u32 ram_size, u32 exram_size)
     return;
   }
 
-  u32 total_instructions = (ram_size + exram_size) >> 2;
+  u32 total_instructions = (2 * ram_size + exram_size) >> 2;
   m_chunk_lookup_table.assign(total_instructions, -1);
 
   for (u32 i = 0; i < m_module->num_chunk_ranges; ++i)
   {
     const auto& chunk = m_module->chunk_ranges[i];
     int start_idx = GetAddressLookupIndex(chunk.start);
-    int end_idx = GetAddressLookupIndex(chunk.end);
+    int end_idx = GetAddressLookupIndex(chunk.end - 1);
 
     if (start_idx >= 0 && end_idx >= start_idx)
     {
-      for (int idx = start_idx; idx < end_idx; ++idx)
+      for (int idx = start_idx; idx <= end_idx; ++idx)
       {
         m_chunk_lookup_table[idx] = static_cast<int>(i);
       }
@@ -65,12 +62,16 @@ int StaticRecompCore::ChunkIndexOf(u32 address) const
 
 bool StaticRecompCore::FastDispatchableAt(u32 address) const
 {
+  if (address < m_lookup_ram_size && (m_guest.msr & 0x20))
+    return false;  // A low effective PC under IR may map to different bytes.
   const int index = ChunkIndexOf(address);
   return index >= 0 && m_chunk_state[index] == CHUNK_VERIFIED;
 }
 
 bool StaticRecompCore::DispatchableAt(u32 address)
 {
+  if (address < m_lookup_ram_size && m_system.GetPPCState().msr.IR)
+    return false;
   const int index = ChunkIndexOf(address);
   if (index < 0)
     return false;
@@ -84,11 +85,11 @@ void StaticRecompCore::VerifyChunk(u32 index)
   const auto& chunk = m_module->chunk_ranges[index];
   auto& memory = m_system.GetMemory();
   const u32 ram_size = memory.GetRamSizeReal();
-  const u32 offset = chunk.start - 0x80000000u;
   const u32 length = chunk.end - chunk.start;
+  const auto offset = StaticRecompAddress::RAMOffset(chunk.start, length, ram_size);
   ++m_verifications;
 
-  if (chunk.start < 0x80000000u || offset >= ram_size || length > ram_size - offset)
+  if (!offset)
   {
     m_chunk_state[index] = CHUNK_FAILED;
     ++m_failed_chunks;
@@ -98,7 +99,7 @@ void StaticRecompCore::VerifyChunk(u32 index)
   }
 
   // FNV-1a 64, matching gen_module_tables.py.
-  const u8* bytes = memory.GetRAM() + offset;
+  const u8* bytes = memory.GetRAM() + *offset;
   u64 hash = 0xCBF29CE484222325ull;
   for (u32 i = 0; i < length; ++i)
   {
@@ -125,7 +126,7 @@ void StaticRecompCore::VerifyChunk(u32 index)
   }
 }
 
-void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length, u32 physical_address)
 {
   if (m_fallback_jit)
   {
@@ -134,32 +135,15 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
 
   if (!m_module_active || length == 0)
     return;
-  const u32 last = address + (length - 1u);
-
-  // Binary search to find the first chunk index that could possibly overlap (chunk.end > address)
-  u32 lo = 0;
-  u32 hi = m_module->num_chunk_ranges;
-  while (lo < hi)
-  {
-    const u32 mid = lo + (hi - lo) / 2;
-    if (m_module->chunk_ranges[mid].end <= address)
-      lo = mid + 1;
-    else
-      hi = mid;
-  }
-
-  for (u32 i = lo; i < m_module->num_chunk_ranges; ++i)
-  {
-    const auto& chunk = m_module->chunk_ranges[i];
-    if (chunk.start > last)
-      break;
-
-    if (m_chunk_state[i] != CHUNK_UNVERIFIED)
-    {
-      if (m_chunk_state[i] == CHUNK_FAILED)
-        --m_failed_chunks;
-      m_chunk_state[i] = CHUNK_UNVERIFIED;
-      ++m_reverify_events;
-    }
-  }
+  StaticRecompAddress::ForEachInvalidatedChunk(
+      {m_module->chunk_ranges, m_module->num_chunk_ranges}, address, length,
+      physical_address, m_lookup_ram_size, [&](size_t i) {
+        if (m_chunk_state[i] != CHUNK_UNVERIFIED)
+        {
+          if (m_chunk_state[i] == CHUNK_FAILED)
+            --m_failed_chunks;
+          m_chunk_state[i] = CHUNK_UNVERIFIED;
+          ++m_reverify_events;
+        }
+      });
 }

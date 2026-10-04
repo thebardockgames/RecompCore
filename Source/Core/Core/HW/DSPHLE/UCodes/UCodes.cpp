@@ -3,6 +3,8 @@
 
 #include "Core/HW/DSPHLE/UCodes/UCodes.h"
 
+#include <cstdio>
+
 #include <cstring>
 #include <memory>
 
@@ -133,6 +135,8 @@ void UCodeInterface::DoStateShared(PointerWrap& p)
 
 std::unique_ptr<UCodeInterface> UCodeFactory(u32 crc, DSPHLE* dsphle, bool wii)
 {
+  // Which DSP microcode the game runs (native audio work starts from this).
+  std::fprintf(stderr, "[dsp] ucode crc=%08x wii=%d\n", crc, wii ? 1 : 0);
   switch (crc)
   {
   case UCODE_ROM:

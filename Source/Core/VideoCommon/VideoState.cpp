@@ -14,6 +14,7 @@
 #include "VideoCommon/FrameDumper.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/GeometryShaderManager.h"
+#include "VideoCommon/NativeGXBridge.h"
 #include "VideoCommon/PixelEngine.h"
 #include "VideoCommon/PixelShaderManager.h"
 #include "VideoCommon/Present.h"
@@ -29,6 +30,10 @@
 
 void VideoCommon_DoState(PointerWrap& p)
 {
+  // NativeGX: the native front end holds the GX state (see NativeGXBridge).
+  if (!p.IsReadMode())
+    NativeGXBridge::SyncStateForSave();
+
   bool software = false;
   p.Do(software);
 
@@ -113,5 +118,6 @@ void VideoCommon_DoState(PointerWrap& p)
     // Inform backend of new state from registers.
     BPReload();
     VertexLoaderManager::MarkAllDirty();
+    NativeGXBridge::ReseedAfterLoad();
   }
 }

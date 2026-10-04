@@ -4,6 +4,7 @@
 #include "Core/PowerPC/JitInterface.h"
 
 #include <string>
+#include <string_view>
 #include <unordered_set>
 
 #include "Common/Assert.h"
@@ -320,6 +321,13 @@ void JitInterface::InvalidateICacheLinesFromJIT(JitInterface& jit_interface, u32
 void JitInterface::CompileExceptionCheck(ExceptionType type)
 {
   if (!m_jit)
+    return;
+
+  // The static core checks timing at dispatch boundaries and has no JIT
+  // blocks to recompile. Its live PC/MSR reside in CPUState during a burst;
+  // reading an opcode through the chassis state here can address virtual
+  // code with translation disabled by a preceding native exception.
+  if (std::string_view(m_jit->GetName()) == "StaticRecomp")
     return;
 
   std::unordered_set<u32>* exception_addresses = nullptr;

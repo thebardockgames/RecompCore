@@ -28,6 +28,7 @@
 #include "VideoCommon/GeometryShaderManager.h"
 #include "VideoCommon/OpcodeDecoding.h"
 #include "VideoCommon/PerfQueryBase.h"
+#include "VideoCommon/FrameInterpolation.h"
 #include "VideoCommon/PixelEngine.h"
 #include "VideoCommon/PixelShaderManager.h"
 #include "VideoCommon/Present.h"
@@ -350,7 +351,9 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
         // render multiple sub-frames and arrange the XFB copies in next to each-other in main
         // memory so they form a single completed XFB. See
         // https://dolphin-emu.org/blog/2017/11/19/hybridxfb/ for examples and more detail.
-        system.GetVideoEvents().after_frame_event.Trigger(system);
+        // A frame-interpolation replay re-renders a frame that already ended.
+        if (!FrameInterpolation::IsReplaying())
+          system.GetVideoEvents().after_frame_event.Trigger(system);
 
         // Note: Theoretically, in the future we could track the VI configuration and try to detect
         //       when an XFB is the last XFB copy of a frame. Not only would we get a clean "end of
