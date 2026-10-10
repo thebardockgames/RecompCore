@@ -102,6 +102,11 @@ public:
   void UpdateAudioDMA();
   void UpdateDSPSlice(int cycles);
 
+  // StaticRecomp native audio replaces the DSP and the audio DMA: both
+  // devices stay idle (no DSP emulation slices, no samples pushed).
+  void SetNativeAudio(bool native) { m_native_audio = native; }
+  bool IsNativeAudio() const { return m_native_audio; }
+
 private:
   void GenerateDSPInterrupt(u64 DSPIntType, s64 cyclesLate);
   static void GlobalGenerateDSPInterrupt(Core::System& system, u64 DSPIntType, s64 cyclesLate);
@@ -184,6 +189,7 @@ private:
   std::unique_ptr<DSPEmulator> m_dsp_emulator;
 
   bool m_is_lle = false;
+  bool m_native_audio = false;
 
   CoreTiming::EventType* m_event_type_generate_dsp_interrupt = nullptr;
   CoreTiming::EventType* m_event_type_complete_aram = nullptr;

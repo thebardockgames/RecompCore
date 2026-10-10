@@ -46,6 +46,12 @@ void JitInterface::SetStaticRecompModuleSource(StaticRecompModuleSource source)
   m_static_recomp_module_source = std::move(source);
 }
 
+void JitInterface::DoExtraState(PointerWrap& p, bool present)
+{
+  if (m_jit)
+    m_jit->DoExtraState(p, present);
+}
+
 void JitInterface::DoState(PointerWrap& p)
 {
   if (m_jit && p.IsReadMode())

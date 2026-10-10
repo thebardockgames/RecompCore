@@ -42,6 +42,7 @@ public:
   ~JitInterface();
 
   void DoState(PointerWrap& p);
+  void DoExtraState(PointerWrap& p, bool present);
 
   CPUCoreBase* InitJitCore(PowerPC::CPUCore core);
   CPUCoreBase* GetCore() const;

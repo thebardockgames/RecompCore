@@ -36,6 +36,7 @@ class MMU;
 struct PowerPCState;
 }  // namespace PowerPC
 class PPCSymbolDB;
+class PointerWrap;
 
 // #define JIT_LOG_GENERATED_CODE  // Enables logging of generated code
 // #define JIT_LOG_GPR             // Enables logging of the PPC general purpose regs
@@ -225,6 +226,10 @@ public:
   virtual const CommonAsmRoutinesBase* GetAsmRoutines() = 0;
 
   virtual bool WantsPageTableMappings() const;
+
+  // Savestate section owned by the CPU core (StaticRecomp native layer).
+  // `present` is false when loading a state saved without it.
+  virtual void DoExtraState(PointerWrap& p, bool present) {}
 
   virtual bool HandleFault(uintptr_t access_address, SContext* ctx) = 0;
   bool HandleStackFault();

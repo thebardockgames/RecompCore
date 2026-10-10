@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeSdk.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeAudio.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+
+#include "Common/ChunkFile.h"
 
 #include "Common/Swap.h"
 #include "Core/HW/GCPad.h"
@@ -234,6 +237,7 @@ void NativeSdk::Bind(u32 count, const u32* addresses, u8* flags, int* any)
   m_pad_read = enable(kPadRead, "PADRead");
   m_kpad_read = enable(kKpadRead, "KPADRead");
   m_dvd_read = !s_game_root.empty() && enable(kDvdReadAbsAsyncPrio, "DVDRead");
+  AudioBind([&](u32 address) { return enable(address, "Audio"); }, wanted("Audio"));
   // The native interrupt handler entry must exit to the dispatcher.
   if (std::getenv("MODERNGEKKO_NATIVE_INTERRUPTS_OFF") == nullptr)
   {
@@ -295,6 +299,7 @@ void NativeSdk::Bind(u32 count, const u32* addresses, u8* flags, int* any)
 
 bool NativeSdk::RunSlow(CPUState& guest)
 {
+  m_last_guest = &guest;
   if (m_trace_file && std::binary_search(m_trace.begin(), m_trace.end(), guest.pc))
     TraceCallEntry(guest);
   if (guest.pc == kPadRead && m_pad_read)
@@ -310,6 +315,8 @@ bool NativeSdk::RunSlow(CPUState& guest)
   }
   if (guest.pc == kKpadRead && m_kpad_read)
     return KpadRead(guest);
+  if (m_audio)
+    return AudioRun(guest);
   return false;
 }
 
@@ -1132,6 +1139,13 @@ bool NativeSdk::DeliverCallback(CPUState& guest)
   if (m_callbacks.empty())
     pi.SetInterrupt(ProcessorInterface::INT_CAUSE_DEBUG, false);
   ++m_callbacks_delivered;
+  if (call.kind != CallbackKind::Call)
+  {
+    // A native audio interrupt: the SDK's own handler takes it from here.
+    if (!AudioEnterHandler(guest, call.kind))
+      guest.pc = guest.lr;
+    return true;
+  }
   if (call.dvd_block)
   {
     // The drive finishing: state and size are set in the interrupt, right
@@ -1156,6 +1170,35 @@ bool NativeSdk::DeliverCallback(CPUState& guest)
   guest.gpr[4] = call.r4;
   guest.pc = call.function;  // returns to the OS dispatcher through lr
   return true;
+}
+
+void NativeSdk::DoState(PointerWrap& p, bool present)
+{
+  if (!present)
+  {
+    // A state saved without the native layer: no native interrupt is pending
+    // in it, and its audio (if any) is the emulated one.
+    m_callbacks.clear();
+    if (m_audio && m_audio->mode == AudioState::Mode::Native)
+    {
+      m_audio->active = false;
+      m_audio->abandoned = true;
+      std::fprintf(stderr, "[native_audio] state without native data: original audio code runs\n");
+    }
+    return;
+  }
+  p.Do(m_callbacks);
+  bool has_audio = m_audio != nullptr;
+  p.Do(has_audio);
+  if (!has_audio)
+    return;
+  if (!m_audio)
+  {
+    std::fprintf(stderr, "[native_audio] state has native audio data, audio hooks are off: load refused\n");
+    p.SetMeasureMode();
+    return;
+  }
+  AudioDoState(p);
 }
 
 void NativeSdk::PrintStats() const
@@ -1184,6 +1227,7 @@ void NativeSdk::PrintStats() const
                  static_cast<unsigned long long>(m_spurious_interrupts),
                  static_cast<unsigned long long>(m_dvd_cancelled));
   }
+  PrintAudioStats();
   if (m_dvd_read)
   {
     print("DVDRead", m_dvd_stats);

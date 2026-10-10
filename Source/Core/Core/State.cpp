@@ -43,6 +43,7 @@
 #include "Core/HW/Wiimote.h"
 #include "Core/Movie.h"
 #include "Core/NetPlay/NetPlayProto.h"
+#include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -154,6 +155,15 @@ static void DoState(Core::System& system, PointerWrap& p)
 #ifdef USE_RETRO_ACHIEVEMENTS
   AchievementManager::GetInstance().DoState(p);
 #endif  // USE_RETRO_ACHIEVEMENTS
+
+  // Optional trailing section of the CPU core (StaticRecomp native layer).
+  // States saved without it still load: the core is told it is absent.
+  constexpr u32 extra_magic = 0x5352584E;  // "SRXN"
+  u32 magic = extra_magic;
+  const bool present = !p.IsReadMode() || p.GetBytesRemaining() >= sizeof(magic);
+  if (present)
+    p.Do(magic);
+  system.GetJitInterface().DoExtraState(p, present && magic == extra_magic);
 }
 
 static bool CheckIfStateLoadIsAllowed(Core::System& system)

@@ -62,6 +62,11 @@ public:
   bool IsWriteMode() const { return m_mode == Mode::Write; }
   bool IsMeasureMode() const { return m_mode == Mode::Measure; }
   bool IsVerifyMode() const { return m_mode == Mode::Verify; }
+  // Bytes left in a read buffer (an optional trailing section may be absent).
+  size_t GetBytesRemaining() const
+  {
+    return *m_ptr_current < m_ptr_end ? static_cast<size_t>(m_ptr_end - *m_ptr_current) : 0;
+  }
 
   template <typename K, class V>
   void Do(std::map<K, V>& x)

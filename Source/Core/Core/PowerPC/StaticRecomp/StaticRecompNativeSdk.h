@@ -19,11 +19,15 @@
 
 #include <array>
 #include <cstdio>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "Common/CommonTypes.h"
 #include "core/cpu.h"
+
+class PointerWrap;
 
 namespace Core
 {
@@ -71,11 +75,21 @@ public:
     if (m_pending.function != Function::None && guest.pc == m_pending.lr &&
         guest.gpr[1] == m_pending.sp)
       FinishVerify(guest);
+    if (m_audio_verify_lr != 0 && guest.pc == m_audio_verify_lr &&
+        guest.gpr[1] == m_audio_verify_sp)
+      AudioFinishVerify();
     if (!m_trace_calls.empty())
       TraceReturns(guest);
   }
 
   void PrintStats() const;
+
+  // Savestate section: pending native interrupts and the native audio state.
+  // `present` is false when loading a state saved without it.
+  void DoState(PointerWrap& p, bool present);
+
+  // Native audio DMA: block boundary (CoreTiming event).
+  void AudioDmaEvent(s64 cycles_late);
 
 private:
   struct PadResult
@@ -155,11 +169,18 @@ private:
   // calls its handler table entry, which points at a never-executed debugger
   // function the dispatcher intercepts. The handler jumps to the callback,
   // which returns into the OS dispatcher (scheduler, context restore).
+  enum class CallbackKind : u8
+  {
+    Call,          // jump to `function` with (r3, r4)
+    DspInterrupt,  // enter the SDK's DSP interrupt handler (__DSPHandler)
+    AiInterrupt,   // enter the SDK's audio DMA interrupt handler (__AIDHandler)
+  };
   struct NativeCallback
   {
     u32 function, r3, r4;
     u32 dvd_block = 0;  // DVD read completing in this interrupt (state set here)
     u32 dvd_length = 0;
+    CallbackKind kind = CallbackKind::Call;
   };
   bool PostCallback(const CPUState& guest, const NativeCallback& call);
   bool InstallNativeInterrupt(const CPUState& guest);
@@ -171,6 +192,29 @@ private:
   u64 m_dvd_cancelled = 0;
   bool CopyToGuest(const CPUState& guest, u32 address, const u8* data, u32 length) const;
   void CheckDvdReads(const CPUState& guest);
+  // Enters an SDK interrupt handler after its hardware acknowledgement:
+  // pushes the handler's frame as its prologue does and resumes at `resume`.
+  bool EnterInterruptHandler(CPUState& guest, u32 frame_size, u32 resume);
+
+  // Native audio (StaticRecompNativeAudio.cpp): the DSP is replaced by a host
+  // AX mixer and the audio interface DMA by a host engine. The SDK's own
+  // dsp.a/ai.a code still runs, except the functions that touch registers.
+  struct AudioState;
+  bool AudioBind(const std::function<bool(u32)>& enable, bool wanted);
+  bool AudioRun(CPUState& guest);
+  bool AudioActivate(const CPUState& guest);
+  bool AudioEnterHandler(CPUState& guest, CallbackKind kind);
+  void AudioPushMail(u32 mail, bool interrupt);
+  void AudioPostInterrupt(CallbackKind kind);
+  void AudioHandleMail(u32 mail);
+  void AudioFinishVerify();
+  void AudioStartDma();
+  void AudioConfigureHost();
+  void AudioDoState(PointerWrap& p);
+  void PrintAudioStats() const;
+  std::unique_ptr<AudioState> m_audio;
+  u32 m_audio_verify_lr = 0, m_audio_verify_sp = 0;
+  CPUState* m_last_guest = nullptr;
 
   u8* Pointer(const CPUState& guest, u32 address, u32 size) const;
   bool Read32(const CPUState& guest, u32 address, u32& value) const;

@@ -60,6 +60,7 @@ public:
   bool FastDispatchableAt(u32 address) const;
 
   void ClearCache() override;
+  void DoExtraState(PointerWrap& p, bool present) override;
   void Jit(u32 em_address) override {}
   bool HandleFault(uintptr_t access_address, SContext* ctx) override { return false; }
 

@@ -406,6 +406,8 @@ void DSPManager::GenerateDSPInterruptFromDSPEmu(DSPInterruptType type, int cycle
 // called whenever SystemTimers thinks the DSP deserves a few more cycles
 void DSPManager::UpdateDSPSlice(int cycles)
 {
+  if (m_native_audio)
+    return;
   if (m_is_lle)
   {
     // use up the rest of the slice(if any)
@@ -424,6 +426,8 @@ void DSPManager::UpdateDSPSlice(int cycles)
 void DSPManager::UpdateAudioDMA()
 {
   static short zero_samples[8 * 2] = {0};
+  if (m_native_audio)
+    return;
   if (m_audio_dma.AudioDMAControl.Enable)
   {
     // Read audio at g_audioDMA.current_source_address in RAM and push onto an
