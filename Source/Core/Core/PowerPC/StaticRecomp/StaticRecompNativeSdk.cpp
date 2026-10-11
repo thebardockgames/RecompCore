@@ -3,6 +3,8 @@
 
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeSdk.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeAudio.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeFs.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeMods.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -90,12 +92,18 @@ std::string s_game_root;
 
 // Native interrupt line (see NativeSdk::PostCallback).
 constexpr u32 kNativeInterruptHandler = 0x80246EC8;  // TRKNubMainLoop: debugger only
+// Return address of native context calls: TRKGetNextEvent, only called by
+// TRKNubMainLoop, which never runs either.
+constexpr u32 kNativeCallReturn = 0x802470DC;
+// SDK interrupt handler frame: OSContext at +8.
+constexpr u32 kContextFrame = 0x2E0;
 constexpr u32 kOsInterruptHandlerTable = kSda - 25992;  // pointer to the handler table
 constexpr u32 kOsInterruptMask = 0x800000C4;
 constexpr u32 kOsUserInterruptMask = 0x800000C8;
 constexpr u32 kNativeInterrupt = 25;  // __OS_INTERRUPT_PI_DEBUG
 constexpr u32 kNativeInterruptBit = 0x80000000u >> kNativeInterrupt;
 constexpr u32 kViInterrupt = 24;  // __OS_INTERRUPT_PI_VI
+constexpr u32 kIpcInterrupt = 27;  // __OS_INTERRUPT_PI_ACR (IPC), installed by IPCCltInit
 
 // PADRead and every routine whose effect it reproduces (FNV-1a 64 of the
 // original DOL bytes).
@@ -167,6 +175,11 @@ bool Moved(s32 current, s32 previous)
 void SetGameRoot(const std::string& path)
 {
   s_game_root = path;
+}
+
+const std::string& GameRoot()
+{
+  return s_game_root;
 }
 
 NativeSdk::NativeSdk(Core::System& system) : m_system(system)
@@ -252,8 +265,18 @@ void NativeSdk::Bind(u32 count, const u32* addresses, u8* flags, int* any)
       m_max = std::max(m_max, kNativeInterruptHandler);
       std::fprintf(stderr, "[native_sdk] native interrupts: OS interrupt %u, handler 0x%08X\n",
                    kNativeInterrupt, kNativeInterruptHandler);
+      const u32* ret = std::lower_bound(addresses, end, kNativeCallReturn);
+      if (ret != end && *ret == kNativeCallReturn)
+      {
+        flags[ret - addresses] = 1;
+        m_context_call_hook = true;
+        m_min = std::min(m_min, kNativeCallReturn);
+        m_max = std::max(m_max, kNativeCallReturn);
+      }
     }
   }
+  FsBind([&](u32 address) { return enable(address, "NAND"); }, wanted("NAND"));
+  m_mods_hooks = ModsBind([&](u32 address) { return enable(address, "Mods"); });
   if (m_dvd_read && m_verify)
   {
     // The comparison runs when the game polls the block it read.
@@ -300,6 +323,14 @@ void NativeSdk::Bind(u32 count, const u32* addresses, u8* flags, int* any)
 bool NativeSdk::RunSlow(CPUState& guest)
 {
   m_last_guest = &guest;
+  if (!m_deferred_callbacks.empty() && InstallNativeInterrupt(guest))
+  {
+    for (const NativeCallback& call : m_deferred_callbacks)
+      PostCallback(guest, call);
+    m_deferred_callbacks.clear();
+  }
+  if (guest.pc == kNativeCallReturn && m_context_call_hook)
+    return ReturnFromContextCall(guest);
   if (m_trace_file && std::binary_search(m_trace.begin(), m_trace.end(), guest.pc))
     TraceCallEntry(guest);
   if (guest.pc == kPadRead && m_pad_read)
@@ -315,6 +346,10 @@ bool NativeSdk::RunSlow(CPUState& guest)
   }
   if (guest.pc == kKpadRead && m_kpad_read)
     return KpadRead(guest);
+  if (m_mods_hooks && ModsRun(guest))
+    return true;
+  if (m_fs && FsRun(guest))
+    return true;
   if (m_audio)
     return AudioRun(guest);
   return false;
@@ -853,6 +888,8 @@ bool NativeSdk::LoadDiscFiles(const CPUState& guest)
 
 bool NativeSdk::ReadDisc(u64 offset, u32 length, std::vector<u8>& out)
 {
+  if (ModsRead(offset, length, out))
+    return true;
   const auto it = std::upper_bound(
       m_disc_files.begin(), m_disc_files.end(), offset,
       [](u64 value, const DiscFile& file) { return value < file.offset; });
@@ -860,6 +897,11 @@ bool NativeSdk::ReadDisc(u64 offset, u32 length, std::vector<u8>& out)
     return false;
   const DiscFile& file = *(it - 1);
   const u64 start = offset - file.offset;
+  // MODERNGEKKO_NATIVE_DVD_LOG=1: which file and range each native read takes.
+  static const bool log_reads = std::getenv("MODERNGEKKO_NATIVE_DVD_LOG") != nullptr;
+  if (log_reads)
+    std::fprintf(stderr, "[dvd_read] %s +0x%llx len 0x%x\n", file.path.c_str(),
+                 static_cast<unsigned long long>(start), length);
   // Reads are rounded up to 32 bytes; the layout pads files with zeros.
   if (start + length > u64(file.size) + 32)
     return false;
@@ -874,6 +916,8 @@ bool NativeSdk::ReadDisc(u64 offset, u32 length, std::vector<u8>& out)
   const bool ok = _fseeki64(f, static_cast<long long>(start), SEEK_SET) == 0 &&
                   std::fread(out.data(), 1, available, f) == available;
   std::fclose(f);
+  if (ok)
+    ModsPatchRead(offset, out);
   return ok;
 }
 
@@ -944,6 +988,8 @@ bool NativeSdk::DvdReadAbs(CPUState& guest)
     return defer();
   }
   std::vector<u8> data;
+  if (LoadDiscFiles(guest))
+    ModsInit(guest);
   if (!LoadDiscFiles(guest) || !ReadDisc(u64(offset_words) * 4, length, data))
     return defer();
   if (m_verify)
@@ -1072,16 +1118,18 @@ bool NativeSdk::InstallNativeInterrupt(const CPUState& guest)
   u8* os_mask = Pointer(guest, kOsInterruptMask, 4);
   u8* user_mask = Pointer(guest, kOsUserInterruptMask, 4);
   // Only once the OS handles interrupts: its external interrupt vector is in
-  // place and the VI driver installed its handler (the table holds leftovers
-  // from the loader before that). On Wii the disc drive belongs to IOS, so
-  // there is no DI handler to look for.
+  // place and an SDK driver installed its handler (the table holds leftovers
+  // from the loader before that): VI, or IPC, which is installed before any
+  // IOS call (SYSCONF is read before VIInit). On Wii the disc drive belongs
+  // to IOS, so there is no DI handler to look for.
   const u8* vector = Pointer(guest, 0x80000500, 16);
   const u8* vi_entry = Pointer(guest, table + 4 * kViInterrupt, 4);
+  const u8* ipc_entry = Pointer(guest, table + 4 * kIpcInterrupt, 4);
   const auto sdk_code = [](u32 address) { return address >= 0x80200000 && address < 0x802A0000; };
   const bool ready = entry && os_mask && user_mask && vector && vi_entry &&
                      Load32(vector) == 0x7C9043A6 && Load32(vector + 4) == 0x808000C0 &&
                      Load32(vector + 8) == 0x9064000C && Load32(vector + 12) == 0x7C7042A6 &&
-                     sdk_code(Load32(vi_entry));
+                     (sdk_code(Load32(vi_entry)) || (ipc_entry && sdk_code(Load32(ipc_entry))));
   if (!ready)
   {
     if (!m_interrupt_not_ready_reported && vector && vi_entry)
@@ -1139,6 +1187,12 @@ bool NativeSdk::DeliverCallback(CPUState& guest)
   if (m_callbacks.empty())
     pi.SetInterrupt(ProcessorInterface::INT_CAUSE_DEBUG, false);
   ++m_callbacks_delivered;
+  if (call.kind == CallbackKind::ContextCall)
+  {
+    if (!EnterContextCall(guest, call))
+      guest.pc = guest.lr;
+    return true;
+  }
   if (call.kind != CallbackKind::Call)
   {
     // A native audio interrupt: the SDK's own handler takes it from here.
@@ -1172,7 +1226,87 @@ bool NativeSdk::DeliverCallback(CPUState& guest)
   return true;
 }
 
-void NativeSdk::DoState(PointerWrap& p, bool present)
+void NativeSdk::PostOrDefer(const NativeCallback& call)
+{
+  if (m_last_guest && PostCallback(*m_last_guest, call))
+    return;
+  m_deferred_callbacks.push_back(call);
+}
+
+void NativeSdk::ClearGuestContext(const CPUState& guest, u32 context)
+{
+  // OSClearContext: mode = state = 0; drop it as the FPU owner.
+  if (u8* p = Pointer(guest, context + 0x1A0, 4))
+    std::memset(p, 0, 4);
+  u8* owner = Pointer(guest, 0x800000D8, 4);
+  if (owner && Load32(owner) == context)
+    Store32(owner, 0);
+}
+
+void NativeSdk::SetGuestContext(CPUState& guest, u32 context)
+{
+  // OSSetCurrentContext: current context (cached and physical), and MSR.FP
+  // on only if this context owns the FPU (lazy FP save/restore).
+  if (u8* p = Pointer(guest, 0x800000D4, 4))
+    Store32(p, context);
+  if (u8* p = Pointer(guest, 0x800000C0, 4))
+    Store32(p, context & 0x3FFFFFFF);
+  const u8* owner = Pointer(guest, 0x800000D8, 4);
+  u8* srr1 = Pointer(guest, context + 0x19C, 4);
+  const bool owns_fpu = owner && Load32(owner) == context;
+  if (srr1)
+    Store32(srr1, owns_fpu ? (Load32(srr1) | 0x2000) : (Load32(srr1) & ~0x2000u));
+  guest.msr = (owns_fpu ? (guest.msr | 0x2000) : (guest.msr & ~0x2000u)) | 0x2;
+}
+
+bool NativeSdk::EnterContextCall(CPUState& guest, const NativeCallback& call)
+{
+  // As IpcReplyHandler: a frame holding an OSContext, made current around
+  // the callback; the callback returns to kNativeCallReturn.
+  const u32 old_sp = guest.gpr[1];
+  const u32 new_sp = old_sp - kContextFrame;
+  u8* frame = Pointer(guest, new_sp, 4);
+  u8* link = Pointer(guest, old_sp + 4, 4);
+  u8* saved = Pointer(guest, new_sp + kContextFrame - 8, 8);
+  if (!frame || !link || !saved || !Pointer(guest, new_sp + 8, 0x2C8))
+    return false;
+  Store32(frame, old_sp);
+  Store32(link, guest.lr);
+  Store32(saved, guest.gpr[30]);
+  Store32(saved + 4, guest.gpr[31]);
+  guest.gpr[1] = new_sp;
+  guest.gpr[31] = guest.gpr[4];  // the interrupted context (OS handler argument)
+  ClearGuestContext(guest, new_sp + 8);
+  SetGuestContext(guest, new_sp + 8);
+  guest.gpr[3] = call.r3;
+  guest.gpr[4] = call.r4;
+  guest.lr = kNativeCallReturn;
+  guest.pc = call.function;
+  return true;
+}
+
+bool NativeSdk::ReturnFromContextCall(CPUState& guest)
+{
+  const u32 sp = guest.gpr[1];
+  const u8* frame = Pointer(guest, sp, 4);
+  const u8* saved = Pointer(guest, sp + kContextFrame - 8, 8);
+  if (!frame || !saved)
+    return false;
+  ClearGuestContext(guest, sp + 8);
+  SetGuestContext(guest, guest.gpr[31]);
+  const u32 old_sp = Load32(frame);
+  const u8* link = Pointer(guest, old_sp + 4, 4);
+  if (!link)
+    return false;
+  guest.gpr[30] = Load32(saved);
+  guest.gpr[31] = Load32(saved + 4);
+  guest.gpr[1] = old_sp;
+  guest.lr = Load32(link);
+  guest.pc = guest.lr;
+  return true;
+}
+
+void NativeSdk::DoState(PointerWrap& p, bool present, u32 version)
 {
   if (!present)
   {
@@ -1188,6 +1322,8 @@ void NativeSdk::DoState(PointerWrap& p, bool present)
     return;
   }
   p.Do(m_callbacks);
+  if (version >= 2)
+    p.Do(m_deferred_callbacks);
   bool has_audio = m_audio != nullptr;
   p.Do(has_audio);
   if (!has_audio)
@@ -1199,6 +1335,18 @@ void NativeSdk::DoState(PointerWrap& p, bool present)
     return;
   }
   AudioDoState(p);
+  if (version < 2)
+    return;
+  bool has_fs = m_fs != nullptr;
+  p.Do(has_fs);
+  if (has_fs && !m_fs)
+  {
+    std::fprintf(stderr, "[native_fs] state has native NAND handles, NAND hooks are off: load refused\n");
+    p.SetMeasureMode();
+    return;
+  }
+  if (has_fs)
+    FsDoState(p);
 }
 
 void NativeSdk::PrintStats() const
@@ -1228,6 +1376,8 @@ void NativeSdk::PrintStats() const
                  static_cast<unsigned long long>(m_dvd_cancelled));
   }
   PrintAudioStats();
+  PrintFsStats();
+  PrintModsStats();
   if (m_dvd_read)
   {
     print("DVDRead", m_dvd_stats);

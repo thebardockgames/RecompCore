@@ -48,6 +48,9 @@ struct CodeFingerprint
 // Folder of the extracted game (sys/, files/); set by the runtime before boot.
 // Native disc reads come from these files.
 void SetGameRoot(const std::string& path);
+const std::string& GameRoot();
+// Folder of user mods (music/ ...); empty: no mods. Served by native disc reads.
+void SetModsRoot(const std::string& path);
 
 class NativeSdk
 {
@@ -86,7 +89,7 @@ public:
 
   // Savestate section: pending native interrupts and the native audio state.
   // `present` is false when loading a state saved without it.
-  void DoState(PointerWrap& p, bool present);
+  void DoState(PointerWrap& p, bool present, u32 version);
 
   // Native audio DMA: block boundary (CoreTiming event).
   void AudioDmaEvent(s64 cycles_late);
@@ -163,6 +166,21 @@ private:
   bool ReadDisc(u64 offset, u32 length, std::vector<u8>& out);
   bool LoadDiscFiles(const CPUState& guest);
 
+  // Mods (StaticRecompNativeMods.cpp): songs in <mods>/music replace or add
+  // to the game's music. The AFS index of wzs3us2.afs is corrected as it is
+  // read, pointing music entries at a virtual area past the end of the disc,
+  // whose reads come from the mod files.
+  struct ModsState;
+  bool ModsBind(const std::function<bool(u32)>& enable);
+  bool ModsRun(CPUState& guest);
+  void PrintModsStats() const;
+  bool m_mods_hooks = false;
+  void ModsInit(const CPUState& guest);
+  bool ModsRead(u64 offset, u32 length, std::vector<u8>& out);
+  void ModsPatchRead(u64 offset, std::vector<u8>& data);
+  std::unique_ptr<ModsState> m_mods;
+  bool m_mods_checked = false;
+
   // Native interrupts: completions of native operations reach the game the
   // way hardware ones do. A callback is queued and an otherwise unused PI line
   // (DEBUG, OS interrupt 25) is raised; the game's OS takes the interrupt and
@@ -174,6 +192,8 @@ private:
     Call,          // jump to `function` with (r3, r4)
     DspInterrupt,  // enter the SDK's DSP interrupt handler (__DSPHandler)
     AiInterrupt,   // enter the SDK's audio DMA interrupt handler (__AIDHandler)
+    ContextCall,   // call `function`(r3, r4) on a fresh OSContext, as the SDK's
+                   // IPC reply handler does (the callback may use the FPU)
   };
   struct NativeCallback
   {
@@ -195,6 +215,24 @@ private:
   // Enters an SDK interrupt handler after its hardware acknowledgement:
   // pushes the handler's frame as its prologue does and resumes at `resume`.
   bool EnterInterruptHandler(CPUState& guest, u32 frame_size, u32 resume);
+  bool EnterContextCall(CPUState& guest, const NativeCallback& call);
+  bool ReturnFromContextCall(CPUState& guest);
+  void ClearGuestContext(const CPUState& guest, u32 context);
+  void SetGuestContext(CPUState& guest, u32 context);
+  // Posts now, or keeps the callback until the OS takes interrupts.
+  void PostOrDefer(const NativeCallback& call);
+  std::vector<NativeCallback> m_deferred_callbacks;
+  bool m_context_call_hook = false;
+
+  // Native NAND file system (StaticRecompNativeFs.cpp): the game's IPC calls
+  // for /dev/fs and NAND paths are served by the host NAND directly, without
+  // the IOS kernel, device dispatch or request timing.
+  struct FsState;
+  bool FsBind(const std::function<bool(u32)>& enable, bool wanted);
+  bool FsRun(CPUState& guest);
+  void FsDoState(PointerWrap& p);
+  void PrintFsStats() const;
+  std::unique_ptr<FsState> m_fs;
 
   // Native audio (StaticRecompNativeAudio.cpp): the DSP is replaced by a host
   // AX mixer and the audio interface DMA by a host engine. The SDK's own

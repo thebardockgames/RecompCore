@@ -312,12 +312,13 @@ void StaticRecompCore::LoadModule()
 void StaticRecompCore::DoExtraState(PointerWrap& p, bool present)
 {
   // Version 1: the native SDK layer (pending native interrupts, native audio).
-  u32 version = m_native_sdk ? 1 : 0;
+  // Version 2: + deferred callbacks and native NAND handles.
+  u32 version = m_native_sdk ? 2 : 0;
   if (present)
     p.Do(version);
   if (m_native_sdk)
   {
-    m_native_sdk->DoState(p, present && version == 1);
+    m_native_sdk->DoState(p, present && version >= 1, version);
   }
   else if (p.IsReadMode() && present && version != 0)
   {
