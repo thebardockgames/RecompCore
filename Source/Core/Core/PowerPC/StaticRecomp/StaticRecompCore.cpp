@@ -286,6 +286,11 @@ void StaticRecompCore::LoadModule()
                desc->entry_point);
   m_native_sdk.reset();
   using NativeHooksFn = u32 (*)(const u32**, unsigned char**, int**);
+  using MenuVersionFn=u32 (*)();
+  const auto menu_version=m_library.IsOpen()?reinterpret_cast<MenuVersionFn>(m_library.GetSymbolAddress("staticrecomp_menu_extension_version")):nullptr;
+  m_menu_extension_version=menu_version?menu_version():0;
+  m_guest.host_call=m_menu_extension_version>=1&&m_menu_extension_version<=3?HookMenuExtension:nullptr;
+  if(m_guest.host_call)std::fprintf(stderr,"[pc_menu] original-controller extension module v%u\n",m_menu_extension_version);
   const auto native_hooks = m_library.IsOpen() ?
       reinterpret_cast<NativeHooksFn>(m_library.GetSymbolAddress("staticrecomp_native_hooks")) :
       nullptr;

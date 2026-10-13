@@ -30,6 +30,7 @@
 #include "VideoCommon/Statistics.h"
 #include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoConfig.h"
+#include "VideoCommon/VideoEvents.h"
 
 #include <inttypes.h>
 #include <mutex>
@@ -422,6 +423,7 @@ void OnScreenUI::Finalize()
   DrawDebugText();
   OSD::DrawMessages();
   DrawChallengesAndLeaderboards();
+  GetVideoEvents().draw_host_ui_event.Trigger();
   ImGui::Render();
 
   // Check for font changes

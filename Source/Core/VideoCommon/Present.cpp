@@ -969,7 +969,10 @@ void Presenter::Present(PresentInfo* present_info)
   {
     m_onscreen_ui->Finalize();
     if (backbuffer_bound)
+    {
       m_onscreen_ui->DrawImGui();
+      GetVideoEvents().after_host_ui_render_event.Trigger();
+    }
   }
 
   // Present to the window system.

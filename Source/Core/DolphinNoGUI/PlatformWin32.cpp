@@ -7,6 +7,7 @@
 #include "Core/Config/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/System.h"
+#include "Core/Host.h"
 
 #include <Windows.h>
 #include <climits>
@@ -27,6 +28,7 @@ public:
   void MainLoop() override;
 
   WindowSystemInfo GetWindowSystemInfo() const override;
+  std::optional<std::string> ResizeClientArea(int width,int height) override;
 
 private:
   static constexpr TCHAR WINDOW_CLASS_NAME[] = _T("DolphinNoGUI");
@@ -84,7 +86,7 @@ bool PlatformWin32::CreateRenderWindow()
   RECT bounds{0, 0, m_window_width, m_window_height};
   if (!AdjustWindowRectEx(&bounds, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_CLIENTEDGE))
     return false;
-  m_hwnd = CreateWindowEx(WS_EX_CLIENTEDGE, WINDOW_CLASS_NAME, _T("Dolphin"), WS_OVERLAPPEDWINDOW,
+  m_hwnd = CreateWindowEx(WS_EX_CLIENTEDGE|(m_keep_minimized?WS_EX_NOACTIVATE:0), WINDOW_CLASS_NAME, _T("Dolphin"), WS_OVERLAPPEDWINDOW|(m_start_minimized?WS_MINIMIZE:0),
                           m_window_x < 0 ? CW_USEDEFAULT : m_window_x,
                           m_window_y < 0 ? CW_USEDEFAULT : m_window_y,
                           bounds.right - bounds.left, bounds.bottom - bounds.top,
@@ -95,7 +97,11 @@ bool PlatformWin32::CreateRenderWindow()
     return false;
   }
 
-  ShowWindow(m_hwnd, SW_SHOW);
+  SetPropW(m_hwnd,L"ModernGekko.ClientWidth",reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(m_window_width)));
+  SetPropW(m_hwnd,L"ModernGekko.ClientHeight",reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(m_window_height)));
+  ShowWindow(m_hwnd, m_start_minimized?SW_SHOWMINNOACTIVE:SW_SHOW);
+  if(m_start_minimized)ShowWindow(m_hwnd,SW_SHOWMINNOACTIVE);
+  std::fprintf(stderr,"[window] start_minimized=%d iconic=%d client=%dx%d\n",int(m_start_minimized),int(IsIconic(m_hwnd)),m_window_width,m_window_height);
   UpdateWindow(m_hwnd);
   return true;
 }
@@ -130,6 +136,8 @@ void PlatformWin32::MainLoop()
     UpdateRunningFlag();
     Core::HostDispatchJobs(Core::System::GetInstance());
     ProcessEvents();
+    if(m_keep_minimized&&!IsIconic(m_hwnd))ShowWindow(m_hwnd,SW_SHOWMINNOACTIVE);
+    HostTick();
     UpdateWindowPosition();
 
     // TODO: Is this sleep appropriate?
@@ -146,10 +154,56 @@ WindowSystemInfo PlatformWin32::GetWindowSystemInfo() const
   return wsi;
 }
 
+std::optional<std::string> PlatformWin32::ResizeClientArea(int width,int height)
+{
+  // A resolution is a client-area request, independent of maximized state.
+  m_window_width=width;m_window_height=height;
+  RECT bounds{0,0,width,height};
+  if(!AdjustWindowRectEx(&bounds,static_cast<DWORD>(GetWindowLongPtr(m_hwnd,GWL_STYLE)),FALSE,
+                        static_cast<DWORD>(GetWindowLongPtr(m_hwnd,GWL_EXSTYLE))))
+    return "No se pudo calcular el tamano de ventana";
+  if(IsIconic(m_hwnd)) {
+    WINDOWPLACEMENT place{sizeof(place)};if(!GetWindowPlacement(m_hwnd,&place))return "No se pudo leer la ventana minimizada";
+    place.rcNormalPosition.right=place.rcNormalPosition.left+bounds.right-bounds.left;
+    place.rcNormalPosition.bottom=place.rcNormalPosition.top+bounds.bottom-bounds.top;
+    place.flags&=~WPF_RESTORETOMAXIMIZED;
+    place.showCmd=SW_SHOWMINNOACTIVE;
+    if(!SetWindowPlacement(m_hwnd,&place))return "No se pudo preparar el nuevo tamano de ventana";
+  } else {
+    if(IsZoomed(m_hwnd)) {
+      WINDOWPLACEMENT place{sizeof(place)};
+      if(!GetWindowPlacement(m_hwnd,&place))return "No se pudo leer la ventana maximizada";
+      place.flags&=~WPF_RESTORETOMAXIMIZED;
+      place.showCmd=SW_SHOWNOACTIVATE;
+      if(!SetWindowPlacement(m_hwnd,&place))return "No se pudo restaurar el tamano de ventana";
+    }
+    if(!SetWindowPos(m_hwnd,nullptr,0,0,bounds.right-bounds.left,bounds.bottom-bounds.top,
+                    SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE))
+      return "No se pudo redimensionar la ventana";
+    RECT actual{};
+    if(!GetClientRect(m_hwnd,&actual)||actual.right-actual.left!=width||actual.bottom-actual.top!=height)
+      return "Windows no acepto el tamano solicitado; restaurando";
+  }
+  SetPropW(m_hwnd,L"ModernGekko.ClientWidth",reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(width)));
+  SetPropW(m_hwnd,L"ModernGekko.ClientHeight",reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(height)));
+  if(g_presenter)g_presenter->ResizeSurface();
+  return {};
+}
+
 void PlatformWin32::UpdateWindowPosition()
 {
   if (m_window_fullscreen)
     return;
+
+  if(IsIconic(m_hwnd)){
+    WINDOWPLACEMENT placement{sizeof(placement)};
+    if(GetWindowPlacement(m_hwnd,&placement)){
+      m_window_x=placement.rcNormalPosition.left;m_window_y=placement.rcNormalPosition.top;
+      m_window_width=static_cast<int>(reinterpret_cast<ULONG_PTR>(GetPropW(m_hwnd,L"ModernGekko.ClientWidth")));
+      m_window_height=static_cast<int>(reinterpret_cast<ULONG_PTR>(GetPropW(m_hwnd,L"ModernGekko.ClientHeight")));
+    }
+    return;
+  }
 
   RECT rc = {};
   if (!GetWindowRect(m_hwnd, &rc))
@@ -157,8 +211,10 @@ void PlatformWin32::UpdateWindowPosition()
 
   m_window_x = rc.left;
   m_window_y = rc.top;
-  m_window_width = rc.right - rc.left;
-  m_window_height = rc.bottom - rc.top;
+  RECT client{};
+  if(GetClientRect(m_hwnd,&client)){
+    m_window_width=client.right-client.left;m_window_height=client.bottom-client.top;
+  }
 }
 
 void PlatformWin32::ProcessEvents()
@@ -198,13 +254,29 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
 
   case WM_SIZE:
   {
-    if (g_presenter)
+    if (g_presenter && wParam != SIZE_MINIMIZED)
       g_presenter->ResizeSurface();
   }
   break;
 
+  case WM_GETMINMAXINFO:
+  {
+    // The normal window must allow resolutions larger than the work area,
+    // including a 1920x1080 client on a 1920x1080 monitor with borders.
+    DefWindowProc(hwnd,msg,wParam,lParam);
+    if(!platform)break;
+    RECT bounds{0,0,platform->m_window_width,platform->m_window_height};
+    if(AdjustWindowRectEx(&bounds,static_cast<DWORD>(GetWindowLongPtr(hwnd,GWL_STYLE)),FALSE,
+                         static_cast<DWORD>(GetWindowLongPtr(hwnd,GWL_EXSTYLE)))) {
+      auto* limits=reinterpret_cast<MINMAXINFO*>(lParam);
+      if(limits->ptMaxTrackSize.x<bounds.right-bounds.left)limits->ptMaxTrackSize.x=bounds.right-bounds.left;
+      if(limits->ptMaxTrackSize.y<bounds.bottom-bounds.top)limits->ptMaxTrackSize.y=bounds.bottom-bounds.top;
+    }
+  }
+  break;
+
   case WM_KEYDOWN:
-    if (wParam == VK_ESCAPE)
+    if (wParam == VK_ESCAPE && !Host_UIBlocksControllerState())
       platform->RequestShutdown();
     break;
 

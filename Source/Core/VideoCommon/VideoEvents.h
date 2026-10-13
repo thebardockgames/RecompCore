@@ -66,6 +66,11 @@ struct PresentInfo
 
 struct VideoEvents
 {
+  // Host UI composition, under OnScreenUI's lock, on the video thread.
+  Common::HookableEvent<> draw_host_ui_event;
+  Common::HookableEvent<> after_host_ui_render_event;
+  // Release host-owned GPU resources on the video thread before device teardown.
+  Common::HookableEvent<> host_resources_shutdown_event;
   // Called when certain video config setting are changed
   Common::HookableEvent<u32> config_changed_event;
 

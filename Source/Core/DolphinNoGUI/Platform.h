@@ -5,6 +5,8 @@
 
 #include <memory>
 #include <string>
+#include <functional>
+#include <optional>
 
 #include "Common/Flag.h"
 #include "Common/WindowSystemInfo.h"
@@ -22,6 +24,10 @@ public:
   virtual void SetTitle(const std::string& title);
   virtual void MainLoop() = 0;
   virtual void SaveWindowGeometry() {}
+  virtual std::optional<std::string> ResizeClientArea(int, int) { return "Window resizing is unavailable on this platform"; }
+  void SetStartMinimized(bool value) { m_start_minimized=value; }
+  void SetKeepMinimized(bool value) { m_keep_minimized=value; }
+  void SetHostTickCallback(std::function<void()> callback) { m_host_tick=std::move(callback); }
 
   virtual WindowSystemInfo GetWindowSystemInfo() const = 0;
 
@@ -57,6 +63,10 @@ public:
 #endif
 
 protected:
+  void HostTick() { if(m_host_tick)m_host_tick(); }
+  bool m_start_minimized=false;
+  bool m_keep_minimized=false;
+  std::function<void()> m_host_tick;
   void UpdateRunningFlag();
 
   Common::Flag m_running{true};

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/VideoBackendBase.h"
+#include "VideoCommon/VideoEvents.h"
 
 #include <algorithm>
 #include <cstring>
@@ -371,6 +372,7 @@ bool VideoBackendBase::InitializeShared(std::unique_ptr<AbstractGfx> gfx,
 
 void VideoBackendBase::ShutdownShared()
 {
+  GetVideoEvents().host_resources_shutdown_event.Trigger();
   auto& system = Core::System::GetInstance();
   system.GetCustomResourceManager().Shutdown();
 

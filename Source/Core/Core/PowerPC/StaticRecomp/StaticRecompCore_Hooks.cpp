@@ -9,6 +9,7 @@
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompKernel.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeSdk.h"
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
 #include "Common/Logging/Log.h"
@@ -20,6 +21,33 @@
 #include <cstdlib>
 #include <unordered_map>
 #include <vector>
+
+bool StaticRecompCore::HookMenuExtension(CPUState* cpu,u32 event)
+{
+  if(!((event>=0xffff0001u&&event<=0xffff0005u)||(event>=0xffff0010u&&event<=0xffff0019u)||(event>=0xffff0020u&&event<=0xffff0021u)||(event>=0xffff0030u&&event<=0xffff0032u)))return false;
+  auto* core=static_cast<StaticRecompCore*>(cpu->external_user_data);
+  auto hook=core->m_menu_extension_hook.load();
+  return hook&&(*hook)(*cpu,event);
+}
+
+std::optional<u32> StaticRecompCore::InvokeMenuFunction(CPUState& caller,u32 address,std::span<const u32> arguments)
+{
+  const bool valid_stack=(caller.gpr[1]>=0x80010000u&&caller.gpr[1]<0x82000000u)||
+                         (caller.gpr[1]>=0x90010000u&&caller.gpr[1]<0x94000000u);
+  if(!m_module||arguments.size()>8||!valid_stack)return {};
+  CPUState invoke=caller;invoke.gpr[1]-=0x800;invoke.pc=address;invoke.lr=0xfffffffc;
+  invoke.downcount=0;invoke.dispatch_budget=0;invoke.exception=0;
+  invoke.instruction_fallback=[](CPUState* state,u32,u32){state->exception=1;};
+  for(size_t n=0;n<arguments.size();++n)invoke.gpr[3+n]=arguments[n];
+  for(int step=0;step<50000&&invoke.pc!=0xfffffffc&&!invoke.exception;++step){
+    if(!DispatchableAt(invoke.pc))return {};
+    if(!(m_native_sdk&&m_native_sdk->Run(invoke))&&!m_module->dispatch(&invoke,invoke.pc))return {};
+  }
+  if(m_module->on_state_loaded)m_module->on_state_loaded(&caller);
+  if(invoke.pc!=0xfffffffc||invoke.exception)return {};
+  caller.downcount+=invoke.downcount;
+  return invoke.gpr[3];
+}
 
 namespace
 {

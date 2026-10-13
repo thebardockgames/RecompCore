@@ -70,6 +70,12 @@ bool SwapChain::CreateSwapChain(bool stereo, bool hdr)
     m_width = client_rc.right - client_rc.left;
     m_height = client_rc.bottom - client_rc.top;
   }
+  const HWND window=static_cast<HWND>(m_wsi.render_surface);
+  if(IsIconic(window)){
+    const auto width=reinterpret_cast<ULONG_PTR>(GetPropW(window,L"ModernGekko.ClientWidth"));
+    const auto height=reinterpret_cast<ULONG_PTR>(GetPropW(window,L"ModernGekko.ClientHeight"));
+    if(width>=640&&width<=7680&&height>=480&&height<=4320){m_width=static_cast<u32>(width);m_height=static_cast<u32>(height);}
+  }
 
   m_stereo = false;
   m_hdr = false;
@@ -205,9 +211,15 @@ void SwapChain::DestroySwapChain()
 bool SwapChain::ResizeSwapChain()
 {
   DestroySwapChainBuffers();
+  UINT width=0,height=0;const HWND window=static_cast<HWND>(m_wsi.render_surface);
+  if(IsIconic(window)){
+    const auto requested_width=reinterpret_cast<ULONG_PTR>(GetPropW(window,L"ModernGekko.ClientWidth"));
+    const auto requested_height=reinterpret_cast<ULONG_PTR>(GetPropW(window,L"ModernGekko.ClientHeight"));
+    if(requested_width>=640&&requested_width<=7680&&requested_height>=480&&requested_height<=4320){width=static_cast<UINT>(requested_width);height=static_cast<UINT>(requested_height);}
+  }
 
   // The swap chain fills up the size of the window if no size is specified
-  HRESULT hr = m_swap_chain->ResizeBuffers(SWAP_CHAIN_BUFFER_COUNT, 0, 0, DXGI_FORMAT_UNKNOWN,
+  HRESULT hr = m_swap_chain->ResizeBuffers(SWAP_CHAIN_BUFFER_COUNT, width, height, DXGI_FORMAT_UNKNOWN,
                                            GetSwapChainFlags());
 
   if (FAILED(hr))

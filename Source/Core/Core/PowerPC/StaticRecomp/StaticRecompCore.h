@@ -7,6 +7,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <atomic>
+#include <functional>
+#include <span>
+#include <optional>
 
 #include "Common/CommonTypes.h"
 #include "Common/DynamicLibrary.h"
@@ -58,6 +62,11 @@ public:
   bool IsModuleActive() const;
   bool DispatchableAt(u32 address);
   bool FastDispatchableAt(u32 address) const;
+  using MenuExtensionHook=std::function<bool(CPUState&,u32)>;
+  void SetMenuExtensionHook(std::shared_ptr<MenuExtensionHook> hook){m_menu_extension_hook.store(std::move(hook));}
+  // Synchronous original AOT utility calls, only from a menu hook on the CPU thread.
+  std::optional<u32> InvokeMenuFunction(CPUState& caller,u32 address,std::span<const u32> arguments);
+  u32 MenuExtensionVersion()const{return m_menu_extension_version;}
 
   void ClearCache() override;
   void DoExtraState(PointerWrap& p, bool present) override;
@@ -133,6 +142,9 @@ private:
   static void HookExternalWrite32(CPUState* cpu, u32 ea, u32 value, u8 rid);
   static void* HookExternalPointer(CPUState* cpu, u32 ea, u32 size);
   static void HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia);
+  static bool HookMenuExtension(CPUState* cpu,u32 event);
+  std::atomic<std::shared_ptr<MenuExtensionHook>> m_menu_extension_hook;
+  u32 m_menu_extension_version=0;
 
   // Keep Dolphin's MSR-derived state (translation mode, feature flags) in step
   // with the guest MSR before any MMU access or exception delivery.
