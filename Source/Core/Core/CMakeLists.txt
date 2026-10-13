@@ -624,6 +624,10 @@ add_library(core
   PowerPC/StaticRecomp/StaticRecompNativeFs.h
   PowerPC/StaticRecomp/StaticRecompNativeMods.cpp
   PowerPC/StaticRecomp/StaticRecompNativeMods.h
+  PowerPC/StaticRecomp/StaticRecompNativePad.cpp
+  PowerPC/StaticRecomp/StaticRecompNativePad.h
+  PowerPC/StaticRecomp/StaticRecompNativeThp.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeThp.h
   PowerPC/StaticRecomp/StaticRecompCore.h
   PowerPC/StaticRecomp/StaticRecompModuleSource.h
   PowerPC/StaticRecomp/StaticRecompLockstep.cpp

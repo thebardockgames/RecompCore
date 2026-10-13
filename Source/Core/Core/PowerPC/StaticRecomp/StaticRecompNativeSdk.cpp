@@ -5,6 +5,8 @@
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeAudio.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeFs.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeMods.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativePad.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeThp.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -115,6 +117,14 @@ constexpr std::array<CodeFingerprint, 7> kPadReadCode = {{
     {0x8024636Cu, 120u, 0xFAA4BFDE3C9F80D0ull},   // SIGetStatus
     {0x80246558u, 292u, 0x5043DAD0B5189B9Cull},   // SIGetResponse
     {0x80246B24u, 436u, 0x8C9B8D5CFE6CF893ull},   // SIGetType
+}};
+// FirstRun_Main (0x8019EF50) shows the wrist strap screen (0x8019E6F0, 1200
+// frames) and the controller notice (0x8019EB2C, 600 frames) before the save
+// check; neither result is used.
+constexpr u32 kStrapScreen = 0x8019E6F0, kStrapScreenReturn = 0x8019F010;
+constexpr u32 kNoticeScreen = 0x8019EB2C, kNoticeScreenReturn = 0x8019F034;
+constexpr std::array<CodeFingerprint, 1> kFirstRunCode = {{
+    {0x8019EF50u, 296u, 0x8DD6FF5950D0E6A4ull},  // FirstRun_Main
 }};
 constexpr std::array<CodeFingerprint, 3> kKpadReadCode = {{
     {0x80258F94u, 1816u, 0xC9D9811811C6C749ull},  // KPADRead
@@ -249,6 +259,7 @@ void NativeSdk::Bind(u32 count, const u32* addresses, u8* flags, int* any)
   };
   m_pad_read = enable(kPadRead, "PADRead");
   m_kpad_read = enable(kKpadRead, "KPADRead");
+  PadBind([&](u32 address) { return enable(address, "PAD"); }, wanted("PAD"));
   m_dvd_read = !s_game_root.empty() && enable(kDvdReadAbsAsyncPrio, "DVDRead");
   AudioBind([&](u32 address) { return enable(address, "Audio"); }, wanted("Audio"));
   // The native interrupt handler entry must exit to the dispatcher.
@@ -277,6 +288,13 @@ void NativeSdk::Bind(u32 count, const u32* addresses, u8* flags, int* any)
   }
   FsBind([&](u32 address) { return enable(address, "NAND"); }, wanted("NAND"));
   m_mods_hooks = ModsBind([&](u32 address) { return enable(address, "Mods"); });
+  ThpBind([&](u32 address) { return enable(address, "THP"); }, wanted("THP") && !m_verify);
+  {
+    const char* notices = std::getenv("MODERNGEKKO_WII_NOTICES");
+    if (!m_verify && !(notices && std::string(notices) == "on") &&
+        enable(kStrapScreen, "SkipNotices") && enable(kNoticeScreen, "SkipNotices"))
+      m_skip_notices = true;
+  }
   if (m_dvd_read && m_verify)
   {
     // The comparison runs when the game polls the block it read.
@@ -334,7 +352,9 @@ bool NativeSdk::RunSlow(CPUState& guest)
   if (m_trace_file && std::binary_search(m_trace.begin(), m_trace.end(), guest.pc))
     TraceCallEntry(guest);
   if (guest.pc == kPadRead && m_pad_read)
-    return PadRead(guest);
+    return m_pad ? PadReadNoSi(guest) : PadRead(guest);
+  if (m_pad && PadRun(guest))
+    return true;
   if (guest.pc == kNativeInterruptHandler && m_interrupt_hook)
     return DeliverCallback(guest);
   if (guest.pc == kDvdReadAbsAsyncPrio && m_dvd_read)
@@ -347,6 +367,10 @@ bool NativeSdk::RunSlow(CPUState& guest)
   if (guest.pc == kKpadRead && m_kpad_read)
     return KpadRead(guest);
   if (m_mods_hooks && ModsRun(guest))
+    return true;
+  if (m_skip_notices && SkipNotice(guest))
+    return true;
+  if (m_thp && ThpRun(guest))
     return true;
   if (m_fs && FsRun(guest))
     return true;
@@ -395,6 +419,14 @@ bool NativeSdk::CodeMatches(const CPUState& guest, const std::array<CodeFingerpr
   }
   return true;
 }
+// Fingerprint list sizes used by the other native modules.
+template bool NativeSdk::CodeMatches(const CPUState&, const std::array<CodeFingerprint, 7>&) const;
+template bool NativeSdk::CodeMatches(const CPUState&, const std::array<CodeFingerprint, 15>&) const;
+
+bool NativeSdk::ThpVerifyPending(const CPUState& guest) const
+{
+  return m_thp->verify_lr != 0 && guest.pc == m_thp->verify_lr && guest.gpr[1] == m_thp->verify_sp;
+}
 
 bool NativeSdk::GetHostPadData(int chan, u32 analog_mode, u32& hi, u32& lo)
 {
@@ -433,6 +465,88 @@ bool NativeSdk::GetHostPadData(int chan, u32 analog_mode, u32& hi, u32& lo)
     break;
   }
   return true;
+}
+
+bool NativeSdk::MakeStatusSpec2(u8* st, u32 hi, u32 lo, u32 analog_mode, u32 pad_type,
+                                const u8* origin, u8* previous, u32 bit, u32& barrel_bits,
+                                bool& reset_idle)
+{
+  // SPEC2_MakeStatus: PADStatus from the controller's poll response. Returns
+  // whether the controller asks for its origin to be read again.
+  const u16 button = u16((hi >> 16) & 0x3FFF);
+  st[0] = u8(button >> 8);
+  st[1] = u8(button);
+  st[2] = u8(hi >> 8);
+  st[3] = u8(hi);
+  switch (analog_mode & 0x700)
+  {
+  case 0x100:
+    st[4] = u8((lo >> 24) & 0xF0);
+    st[5] = u8((lo >> 20) & 0xF0);
+    st[6] = u8(lo >> 16);
+    st[7] = u8(lo >> 8);
+    st[8] = u8(lo & 0xF0);
+    st[9] = u8((lo << 4) & 0xF0);
+    break;
+  case 0x200:
+    st[4] = u8((lo >> 24) & 0xF0);
+    st[5] = u8((lo >> 20) & 0xF0);
+    st[6] = u8((lo >> 16) & 0xF0);
+    st[7] = u8((lo >> 12) & 0xF0);
+    st[8] = u8(lo >> 8);
+    st[9] = u8(lo);
+    break;
+  case 0x300:
+    st[4] = u8(lo >> 24);
+    st[5] = u8(lo >> 16);
+    st[6] = u8(lo >> 8);
+    st[7] = u8(lo);
+    st[8] = 0;
+    st[9] = 0;
+    break;
+  case 0x400:
+    st[4] = u8(lo >> 24);
+    st[5] = u8(lo >> 16);
+    st[6] = 0;
+    st[7] = 0;
+    st[8] = u8(lo >> 8);
+    st[9] = u8(lo);
+    break;
+  default:  // 0x000, 0x500, 0x600, 0x700
+    st[4] = u8(lo >> 24);
+    st[5] = u8(lo >> 16);
+    st[6] = u8((lo >> 8) & 0xF0);
+    st[7] = u8((lo >> 4) & 0xF0);
+    st[8] = u8(lo & 0xF0);
+    st[9] = u8((lo << 4) & 0xF0);
+    break;
+  }
+  for (int i = 2; i < 6; ++i)
+    st[i] = u8(st[i] - 128);
+  if ((pad_type & 0xFFFF0000u) == 0x09000000u && !(button & kPadUseOrigin))
+  {
+    // Standard controller that has not sent its origin yet: centred sticks.
+    barrel_bits |= bit;
+    std::memset(st + 2, 0, 4);
+  }
+  else
+  {
+    barrel_bits &= ~bit;
+    for (int i = 2; i < 6; ++i)
+      st[i] = ClampS8(st[i], origin[i]);
+    st[6] = ClampU8(st[6], origin[6]);
+    st[7] = ClampU8(st[7], origin[7]);
+    // Any input change restarts the screen-dimming idle count.
+    u8* prev = previous;
+    bool moved = false;
+    for (int i = 2; i < 6; ++i)
+      moved = moved || Moved(s8(st[i]), s8(prev[i]));
+    moved = moved || Moved(st[6], prev[6]) || Moved(st[7], prev[7]);
+    if (moved || st[0] != prev[0] || st[1] != prev[1])
+      reset_idle = true;
+    std::memcpy(prev, st, 12);
+  }
+  return (button & kPadOriginRequest) != 0;
 }
 
 bool NativeSdk::ComputePadRead(const CPUState& guest, bool from_si_latch, PadResult& out)
@@ -531,83 +645,9 @@ bool NativeSdk::ComputePadRead(const CPUState& guest, bool from_si_latch, PadRes
       continue;
     }
 
-    // SPEC2_MakeStatus.
-    const u16 button = u16((hi >> 16) & 0x3FFF);
-    st[0] = u8(button >> 8);
-    st[1] = u8(button);
-    st[2] = u8(hi >> 8);
-    st[3] = u8(hi);
-    switch (analog_mode & 0x700)
-    {
-    case 0x100:
-      st[4] = u8((lo >> 24) & 0xF0);
-      st[5] = u8((lo >> 20) & 0xF0);
-      st[6] = u8(lo >> 16);
-      st[7] = u8(lo >> 8);
-      st[8] = u8(lo & 0xF0);
-      st[9] = u8((lo << 4) & 0xF0);
-      break;
-    case 0x200:
-      st[4] = u8((lo >> 24) & 0xF0);
-      st[5] = u8((lo >> 20) & 0xF0);
-      st[6] = u8((lo >> 16) & 0xF0);
-      st[7] = u8((lo >> 12) & 0xF0);
-      st[8] = u8(lo >> 8);
-      st[9] = u8(lo);
-      break;
-    case 0x300:
-      st[4] = u8(lo >> 24);
-      st[5] = u8(lo >> 16);
-      st[6] = u8(lo >> 8);
-      st[7] = u8(lo);
-      st[8] = 0;
-      st[9] = 0;
-      break;
-    case 0x400:
-      st[4] = u8(lo >> 24);
-      st[5] = u8(lo >> 16);
-      st[6] = 0;
-      st[7] = 0;
-      st[8] = u8(lo >> 8);
-      st[9] = u8(lo);
-      break;
-    default:  // 0x000, 0x500, 0x600, 0x700
-      st[4] = u8(lo >> 24);
-      st[5] = u8(lo >> 16);
-      st[6] = u8((lo >> 8) & 0xF0);
-      st[7] = u8((lo >> 4) & 0xF0);
-      st[8] = u8(lo & 0xF0);
-      st[9] = u8((lo << 4) & 0xF0);
-      break;
-    }
-    for (int i = 2; i < 6; ++i)
-      st[i] = u8(st[i] - 128);
-    if ((Load32(pad_types + 4 * chan) & 0xFFFF0000u) == 0x09000000u && !(button & kPadUseOrigin))
-    {
-      // Standard controller that has not sent its origin yet: centred sticks.
-      out.barrel_bits |= bit;
-      std::memset(st + 2, 0, 4);
-    }
-    else
-    {
-      out.barrel_bits &= ~bit;
-      const u8* origin = origins + 12 * chan;
-      for (int i = 2; i < 6; ++i)
-        st[i] = ClampS8(st[i], origin[i]);
-      st[6] = ClampU8(st[6], origin[6]);
-      st[7] = ClampU8(st[7], origin[7]);
-      // Any input change restarts the screen-dimming idle count.
-      u8* prev = &out.previous[12 * chan];
-      bool moved = false;
-      for (int i = 2; i < 6; ++i)
-        moved = moved || Moved(s8(st[i]), s8(prev[i]));
-      moved = moved || Moved(st[6], prev[6]) || Moved(st[7], prev[7]);
-      if (moved || st[0] != prev[0] || st[1] != prev[1])
-        out.reset_idle = true;
-      std::memcpy(prev, st, 12);
-    }
     // An origin request starts an SI origin read: not modelled.
-    if (button & kPadOriginRequest)
+    if (MakeStatusSpec2(st, hi, lo, analog_mode, Load32(pad_types + 4 * chan), origins + 12 * chan,
+                        &out.previous[12 * chan], bit, out.barrel_bits, out.reset_idle))
       return false;
     st[10] = 0;  // PAD_ERR_NONE
     st[1] = u8(st[1] & ~kPadUseOrigin);
@@ -1349,8 +1389,22 @@ void NativeSdk::DoState(PointerWrap& p, bool present, u32 version)
     FsDoState(p);
 }
 
+bool NativeSdk::SkipNotice(CPUState& guest)
+{
+  if (!((guest.pc == kStrapScreen && guest.lr == kStrapScreenReturn) ||
+        (guest.pc == kNoticeScreen && guest.lr == kNoticeScreenReturn)) ||
+      guest.gpr[13] != kSda || !CodeMatches(guest, kFirstRunCode))
+    return false;
+  guest.pc = guest.lr;
+  ++m_skipped_notices;
+  return true;
+}
+
 void NativeSdk::PrintStats() const
 {
+  if (m_skip_notices)
+    std::fprintf(stderr, "[native_sdk] Wii notice screens skipped=%llu\n",
+                 static_cast<unsigned long long>(m_skipped_notices));
   const auto print = [](const char* name, const Stats& s) {
     std::fprintf(stderr,
                  "[native_sdk] %s native=%llu deferred=%llu verified=%llu mismatches=%llu "
@@ -1375,6 +1429,8 @@ void NativeSdk::PrintStats() const
                  static_cast<unsigned long long>(m_spurious_interrupts),
                  static_cast<unsigned long long>(m_dvd_cancelled));
   }
+  PrintPadStats();
+  PrintThpStats();
   PrintAudioStats();
   PrintFsStats();
   PrintModsStats();

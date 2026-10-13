@@ -222,7 +222,9 @@ bool NativeSdk::FsRun(CPUState& guest)
     // before the OS takes them, the original keeps this handle.
     if (!IsNandPath(path) || !InstallNativeInterrupt(guest))
     {
-      ++fs.opens_original;
+      if (++fs.opens_original <= 24)
+        std::fprintf(stderr, "[native_fs] open %s mode %u: original IOS\n", path.c_str(),
+                     guest.gpr[4] & 3);
       return false;
     }
     ++fs.opens;

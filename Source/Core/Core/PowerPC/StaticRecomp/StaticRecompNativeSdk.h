@@ -81,6 +81,8 @@ public:
     if (m_audio_verify_lr != 0 && guest.pc == m_audio_verify_lr &&
         guest.gpr[1] == m_audio_verify_sp)
       AudioFinishVerify();
+    if (m_thp && ThpVerifyPending(guest))
+      ThpFinishVerify(guest);
     if (!m_trace_calls.empty())
       TraceReturns(guest);
   }
@@ -161,10 +163,53 @@ private:
   void FinishVerify(const CPUState& guest);
   bool PadMatches(const CPUState& guest);
   bool KpadMatches(const CPUState& guest);
+  // SPEC2_MakeStatus on a poll response (hi, lo): fills st[0..9], updates
+  // `previous`, the barrel bit and the dimming reset. True: origin request.
+  static bool MakeStatusSpec2(u8* st, u32 hi, u32 lo, u32 analog_mode, u32 pad_type,
+                              const u8* origin, u8* previous, u32 bit, u32& barrel_bits,
+                              bool& reset_idle);
+
+  // Native PAD library (StaticRecompNativePad.cpp): PADReset, PADRecalibrate,
+  // PADRead and PADControlMotor on the SDK's own variables and the PC
+  // controller, without the serial interface.
+  struct PadState;
+  bool PadBind(const std::function<bool(u32)>& enable, bool wanted);
+  bool PadRun(CPUState& guest);
+  bool PadReady(const CPUState& guest);
+  bool PadReadNoSi(CPUState& guest);
+  void PadReset(const CPUState& guest, u32 mask, bool recalibrate);
+  void PadReadOrigin(const CPUState& guest, u32 chan);
+  void PadUpdateOrigin(const CPUState& guest, u32 chan);
+  bool PadVar(const CPUState& guest, u32 address, u32& value) const;
+  void PadSetVar(const CPUState& guest, u32 address, u32 value) const;
+  bool HostPadConnected(int chan);
+  void PrintPadStats() const;
+  std::unique_ptr<PadState> m_pad;
+
   bool DvdReadAbs(CPUState& guest);
   // Reads `length` bytes at partition offset `offset` from the extracted files.
   bool ReadDisc(u64 offset, u32 length, std::vector<u8>& out);
   bool LoadDiscFiles(const CPUState& guest);
+
+  // Native THP video decoder (StaticRecompNativeThp.cpp): THPVideoDecode on
+  // the host, with the SDK's arithmetic (identical planes).
+  struct ThpState;
+  bool ThpBind(const std::function<bool(u32)>& enable, bool wanted);
+  bool ThpRun(CPUState& guest);
+  bool ThpDecodeFrame(const CPUState& guest, ThpState& thp);
+  bool ThpReadGuest(const CPUState& guest, u32 address, size_t size, std::vector<u8>& out) const;
+  bool ThpWriteGuest(const CPUState& guest, u32 address, const std::vector<u8>& data) const;
+  void ThpFinishVerify(const CPUState& guest);
+  bool ThpVerifyPending(const CPUState& guest) const;
+  void PrintThpStats() const;
+  std::unique_ptr<ThpState> m_thp;
+
+  // Boot patch: the Wii wrist strap and controller notice screens that
+  // FirstRun_Main shows before the save check return at once
+  // (MODERNGEKKO_WII_NOTICES=on keeps them).
+  bool SkipNotice(CPUState& guest);
+  bool m_skip_notices = false;
+  u64 m_skipped_notices = 0;
 
   // Mods (StaticRecompNativeMods.cpp): songs in <mods>/music replace or add
   // to the game's music. The AFS index of wzs3us2.afs is corrected as it is
