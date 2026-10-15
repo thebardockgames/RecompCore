@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <stdexcept>
 
 #include "Common/ChunkFile.h"
 
@@ -1389,6 +1390,19 @@ void NativeSdk::DoState(PointerWrap& p, bool present, u32 version)
     FsDoState(p);
 }
 
+bool NativeSdk::SkipBootNotice(CPUState& guest)
+{
+  const char* selection=std::getenv("MODERNGEKKO_NATIVE_SDK");
+  const std::string names=selection?selection:"all";
+  const char* notices=std::getenv("MODERNGEKKO_WII_NOTICES");
+  if(m_verify || (notices && std::string(notices)=="on") ||
+     !(names=="all" || (","+names+",").find(",SkipNotices,")!=std::string::npos))return false;
+  if(!SkipNotice(guest))return false;
+  m_skip_notices=true;
+  std::fprintf(stderr,"[native_sdk] boot notice omitted, return=0x%08X\n",guest.pc);
+  return true;
+}
+
 bool NativeSdk::SkipNotice(CPUState& guest)
 {
   if (!((guest.pc == kStrapScreen && guest.lr == kStrapScreenReturn) ||
@@ -1400,8 +1414,22 @@ bool NativeSdk::SkipNotice(CPUState& guest)
   return true;
 }
 
+void NativeSdk::AuditCallbackGuest(const CPUState& guest)
+{
+  ++m_callback_guest_checks;
+  if(m_last_guest && m_last_guest != &guest)
+  {
+    ++m_callback_guest_mismatches;
+    throw std::runtime_error("Native SDK callback retained a temporary CPU state");
+  }
+}
+
 void NativeSdk::PrintStats() const
 {
+  std::fprintf(stderr,"[native_sdk] callback guest lifetime: restores=%llu checks=%llu mismatches=%llu\n",
+               static_cast<unsigned long long>(m_callback_guest_restores),
+               static_cast<unsigned long long>(m_callback_guest_checks),
+               static_cast<unsigned long long>(m_callback_guest_mismatches));
   if (m_skip_notices)
     std::fprintf(stderr, "[native_sdk] Wii notice screens skipped=%llu\n",
                  static_cast<unsigned long long>(m_skipped_notices));

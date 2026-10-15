@@ -33,6 +33,7 @@ void StaticRecompCore::Run()
   auto& interpreter = m_system.GetInterpreter();
   auto& memory = m_system.GetMemory();
   const CPU::State* state_ptr = m_system.GetCPU().GetStatePtr();
+  const bool audit_callback_guest = std::getenv("MODERNGEKKO_NATIVE_CALLBACK_GUEST_AUDIT") != nullptr;
 
   m_guest.ram = memory.GetRAM();
   m_guest.ram_size = memory.GetRamSizeReal();
@@ -56,6 +57,7 @@ void StaticRecompCore::Run()
 
   while (*state_ptr == CPU::State::Running)
   {
+    if(audit_callback_guest && m_native_sdk)m_native_sdk->AuditCallbackGuest(m_guest);
     core_timing.Advance();
     const std::string current_game_id = SConfig::GetInstance().GetGameID();
     m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);

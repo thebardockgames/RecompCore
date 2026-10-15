@@ -55,6 +55,8 @@ void SetModsRoot(const std::string& path);
 class NativeSdk
 {
 public:
+  // Legacy AOT modules can expose boot calls through the host callback.
+  bool SkipBootNotice(CPUState& guest);
   explicit NativeSdk(Core::System& system);
   ~NativeSdk();
 
@@ -95,6 +97,15 @@ public:
 
   // Native audio DMA: block boundary (CoreTiming event).
   void AudioDmaEvent(s64 cycles_late);
+
+  // Synchronous host calls dispatch a temporary CPUState. Rebind to their
+  // live caller before that temporary leaves scope: timing callbacks retain
+  // this reference between dispatches (including with muted host output).
+  void RestoreCallbackGuest(CPUState& guest) noexcept {
+    m_last_guest = &guest;
+    ++m_callback_guest_restores;
+  }
+  void AuditCallbackGuest(const CPUState& guest);
 
 private:
   struct PadResult
@@ -298,6 +309,7 @@ private:
   std::unique_ptr<AudioState> m_audio;
   u32 m_audio_verify_lr = 0, m_audio_verify_sp = 0;
   CPUState* m_last_guest = nullptr;
+  u64 m_callback_guest_restores = 0, m_callback_guest_checks = 0, m_callback_guest_mismatches = 0;
 
   u8* Pointer(const CPUState& guest, u32 address, u32 size) const;
   bool Read32(const CPUState& guest, u32 address, u32& value) const;
