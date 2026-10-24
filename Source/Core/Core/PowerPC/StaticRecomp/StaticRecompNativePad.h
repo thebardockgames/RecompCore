@@ -7,7 +7,7 @@
 
 #include <array>
 
-#include "Common/CommonTypes.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompTypes.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeSdk.h"
 
 namespace StaticRecompNativeSdk

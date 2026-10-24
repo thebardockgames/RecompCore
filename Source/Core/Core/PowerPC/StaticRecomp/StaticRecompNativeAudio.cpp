@@ -16,7 +16,7 @@
 //    queued as mails and raise a native interrupt that enters __DSPHandler
 //    past its register acknowledgement.
 //  * Audio DMA: AIInit/AIInitDMA/AIStartDMA and the register getters are
-//    native. A CoreTiming event at the end of each block sends the block to
+//    native. A native clock event at the end of each block sends the block to
 //    the host mixer and raises a native interrupt that enters __AIDHandler
 //    past its acknowledgement; the SDK's handler calls the game's callback.
 //  * OS audio init/stop (__OSInitAudioSystem, __OSStopAudioSystem), which
@@ -36,79 +36,23 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "AudioCommon/AudioCommon.h"
-#include "AudioCommon/Mixer.h"
-#include "AudioCommon/SoundStream.h"
-#include "Common/ChunkFile.h"
-#include "Common/Hash.h"
-#include "Core/CoreTiming.h"
-#include "Core/HW/AudioInterface.h"
-#include "Core/HW/DSP.h"
-#include "Core/HW/Memmap.h"
-#include "Core/HW/SystemTimers.h"
-#include "Core/System.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompHostAudio.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompStateStream.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompUtil.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeClock.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompGuestMemory.h"
 
 namespace StaticRecompNativeSdk
 {
 namespace
 {
-constexpr u32 kSda = 0x806370A0;  // r13
+#include "native/audio.inc"  // the game's addresses and fingerprints
 
-// dsp.a
-constexpr u32 kDspCheckMailToDsp = 0x80228A58;
-constexpr u32 kDspCheckMailFromDsp = 0x80228A68;
-constexpr u32 kDspReadMailFromDsp = 0x80228A78;
-constexpr u32 kDspSendMailToDsp = 0x80228A8C;
-constexpr u32 kDspInit = 0x80228AA0;
-constexpr u32 kDspHandlerResume = 0x80228D14;  // __DSPHandler after the DSPCR acknowledgement
-constexpr u32 kDspInitFlag = kSda - 0x6190;
-constexpr u32 kDspTaskGlobals[] = {kSda - 0x6180, kSda - 0x6174, kSda - 0x617C, kSda - 0x6178};
-// ai.a
-constexpr u32 kAiInit = 0x8022089C;
-constexpr u32 kAiInitDma = 0x802207C8;
-constexpr u32 kAiStartDma = 0x80220844;
-constexpr u32 kAiGetDmaBytesLeft = 0x80220858;
-constexpr u32 kAiGetDmaStartAddr = 0x80220868;
-constexpr u32 kAiGetDspSampleRate = 0x80220888;
-constexpr u32 kAiHandlerResume = 0x80220A4C;  // __AIDHandler after the DSPCR acknowledgement
-constexpr u32 kAiInitFlag = kSda - 0x6320;
-constexpr u32 kAiCallback = kSda - 0x62E8;
-constexpr u32 kAiCallbackStack = kSda - 0x62EC;
-// OS
-constexpr u32 kOsInitAudioSystem = 0x80207B30;
-constexpr u32 kOsStopAudioSystem = 0x80207CF8;
 constexpr u32 kBusClock = 0x800000F8;
 // Both SDK interrupt handlers open with stwu r1,-0x2E0(r1).
 constexpr u32 kHandlerFrame = 0x2E0;
 
-constexpr u32 kHooks[] = {kOsInitAudioSystem, kOsStopAudioSystem, kAiInitDma,
-                          kAiStartDma,        kAiGetDmaBytesLeft, kAiGetDmaStartAddr,
-                          kAiGetDspSampleRate, kAiInit,           kDspCheckMailToDsp,
-                          kDspCheckMailFromDsp, kDspReadMailFromDsp, kDspSendMailToDsp,
-                          kDspInit};
 
-// The replaced functions and the SDK code the replacement relies on.
-constexpr std::array<CodeFingerprint, 19> kAudioCode = {{
-    {0x80228A58u, 0x10u, 0xC27236368ABFDBBAull},   // DSPCheckMailToDSP
-    {0x80228A68u, 0x10u, 0x742444C7E62E105Eull},   // DSPCheckMailFromDSP
-    {0x80228A78u, 0x14u, 0xE18609E1983444DEull},   // DSPReadMailFromDSP
-    {0x80228A8Cu, 0x14u, 0x3346D4294872614Full},   // DSPSendMailToDSP
-    {0x80228AA0u, 0xC0u, 0xB5F6B3343A34D1E8ull},   // DSPInit
-    {0x80228B68u, 0x70u, 0xBEF505A1EC4396C3ull},   // DSPAddTask
-    {0x80228CE4u, 0x434u, 0x1F486721CB15192Bull},  // __DSPHandler
-    {0x802292BCu, 0x18Cu, 0x13924A6231AEACDFull},  // __DSP_boot_task
-    {0x80229448u, 0x9Cu, 0x7898FA0DA40DF7DDull},   // __DSP_insert_task
-    {0x80220784u, 0x44u, 0xDFC616B599D0C3BDull},   // AIRegisterDMACallback
-    {0x802207C8u, 0x7Cu, 0x198E5D4F118EF335ull},   // AIInitDMA
-    {0x80220844u, 0x14u, 0xA8A5BBE315AEECEBull},   // AIStartDMA
-    {0x80220858u, 0x10u, 0xF608C1142EDF3E0Aull},   // AIGetDMABytesLeft
-    {0x80220868u, 0x18u, 0x10C4B245F256A0ABull},   // AIGetDMAStartAddr
-    {0x80220888u, 0x14u, 0x2510F640197BE948ull},   // AIGetDSPSampleRate
-    {0x8022089Cu, 0x180u, 0x530A0669A6857648ull},  // AIInit
-    {0x80220A1Cu, 0xA8u, 0xAF0D8ED7A1055CA2ull},   // __AIDHandler
-    {0x80207B30u, 0x1C8u, 0x2B39EB215298DF34ull},  // __OSInitAudioSystem
-    {0x80207CF8u, 0xCCu, 0x4CB25AFE0D455DDBull},   // __OSStopAudioSystem
-}};
 
 // DSP mail protocol (Dolphin UCodes.h / AX.h).
 constexpr u32 kRomReady = 0x8071FEED;
@@ -125,7 +69,6 @@ constexpr u32 kMailContinue = 0xCDD10003;
 constexpr s64 kAudioHookCycles = 20;
 constexpr s64 kCommandListCycles = 200;
 
-NativeSdk* s_audio_owner = nullptr;
 
 u64 Fnv1a(const u8* data, u32 size)
 {
@@ -148,18 +91,20 @@ u32 Load32(const u8* p)
   return (u32(p[0]) << 24) | (u32(p[1]) << 16) | (u32(p[2]) << 8) | p[3];
 }
 
-void DmaCallback(Core::System&, u64, s64 cycles_late)
-{
-  if (s_audio_owner)
-    s_audio_owner->AudioDmaEvent(cycles_late);
-}
 }  // namespace
 
-NativeSdk::AudioState::~AudioState()
+NativeSdk::AudioState::~AudioState() = default;
+
+namespace
 {
-  if (mode == Mode::Native)
-    s_audio_owner = nullptr;
-}
+constexpr u32 kAiRegisterBase = 0xCD006C00u;
+// Power-on values (the chassis's AudioInterfaceManager::Init and
+// DSPManager::Init): AICR with AISFR = 48 kHz and AIDFR = 32 kHz, the DSP
+// halted.
+constexpr u32 kAiControlPowerOn = (1u << 1) | (1u << 6);
+constexpr u16 kDspControlPowerOn = 1u << 2;
+constexpr u32 kAid32kHzDivisorWii = 1125 * 2 * 3 / 2;
+}  // namespace
 
 bool NativeSdk::AudioBind(const std::function<bool(u32)>& enable, bool wanted)
 {
@@ -192,8 +137,8 @@ bool NativeSdk::AudioBind(const std::function<bool(u32)>& enable, bool wanted)
     }
   }
   m_audio->mode = AudioState::Mode::Native;
-  s_audio_owner = this;
-  m_audio->dma_event = m_system.GetCoreTiming().RegisterEvent("NativeAudioDMA", DmaCallback);
+  if (auto* clock = StaticRecompNativeClock::NativeClock::Instance())
+    m_audio->dma_event = clock->Register("NativeAudioDMA", [this](u64, s64 late) { AudioDmaEvent(late); });
   std::fprintf(stderr, "[native_audio] native DSP (AX mixer) and audio DMA: %zu hooks\n",
                std::size(kHooks));
   return true;
@@ -215,7 +160,7 @@ bool NativeSdk::AudioActivate(const CPUState& guest)
   }
   if (!code_matches)
     return false;
-  a.mixer = std::make_unique<StaticRecompNativeAudio::NativeAxWii>(m_system.GetMemory());
+  a.mixer = std::make_unique<StaticRecompNativeAudio::NativeAxWii>(StaticRecompGuestMemory::GuestMemory::Own());
   if (a.mode == AudioState::Mode::Native)
     AudioConfigureHost();
   a.active = true;
@@ -226,16 +171,21 @@ void NativeSdk::AudioConfigureHost()
 {
   AudioState& a = *m_audio;
   // Nothing emulated runs from here on: Dolphin's DSP and audio DMA stay idle.
-  m_system.GetDSP().SetNativeAudio(true);
-  const u32 divisor = m_system.GetAudioInterface().Get32KHzSampleRateDivisor();
-  if (SoundStream* stream = m_system.GetSoundStream())
-    stream->GetMixer()->SetDMAInputSampleRateDivisor(divisor);
-  // Same rate as Dolphin's audio DMA: 32 bytes = 8 stereo samples at 32 kHz.
-  a.ticks_per_32_bytes = u64(m_system.GetSystemTimers().GetTicksPerSecond()) * divisor /
-                         (Mixer::FIXED_SAMPLE_RATE_DIVIDEND * 4 / 32);
+  if (s_chassis.park_audio)
+    s_chassis.park_audio();
+  s_audio_native = true;
+  // The audio DMA clock: 108 MHz / divisor samples per second (32 kHz on Wii).
+  constexpr u64 kAudioClockHz = 54000000ull * 2;
+  // The AI's 32 kHz divisor on Wii: 1125 * 2 (48 kHz) * 3 / 2.
+  constexpr u32 divisor = kAid32kHzDivisorWii;
+  if (HostAudioSink* sink = GetHostAudioSink())
+    sink->SetInputSampleRate(static_cast<u32>((kAudioClockHz + divisor / 2) / divisor));
+  // Same cadence as the hardware DMA: 32 bytes = 8 stereo samples.
+  a.ticks_per_32_bytes = u64(StaticRecompNativeClock::NativeClock::CurrentTicksPerSecond()) * divisor /
+                         (kAudioClockHz * 4 / 32);
 }
 
-void NativeSdk::AudioDoState(PointerWrap& p)
+void NativeSdk::AudioDoState(StaticRecompState::StateStream& p, u32 version)
 {
   AudioState& a = *m_audio;
   u32 saved_mode = static_cast<u32>(a.mode);
@@ -259,12 +209,21 @@ void NativeSdk::AudioDoState(PointerWrap& p)
   p.Do(a.block_start);
   p.Do(a.dma_running);
   p.Do(a.pending_ai_interrupts);
+  if (version >= 8)
+  {
+    p.Do(a.ai_regs_seeded);
+    p.Do(a.ai_control);
+    p.Do(a.ai_volume);
+    p.Do(a.ai_interrupt_timing);
+    p.Do(a.dsp_control_seeded);
+    p.Do(a.dsp_control);
+  }
   bool has_mixer = a.mixer != nullptr;
   p.Do(has_mixer);
   if (has_mixer)
   {
     if (!a.mixer)
-      a.mixer = std::make_unique<StaticRecompNativeAudio::NativeAxWii>(m_system.GetMemory());
+      a.mixer = std::make_unique<StaticRecompNativeAudio::NativeAxWii>(StaticRecompGuestMemory::GuestMemory::Own());
     a.mixer->DoState(p);
   }
   if (!p.IsReadMode())
@@ -275,6 +234,18 @@ void NativeSdk::AudioDoState(PointerWrap& p)
     if (saved_native)
     {
       AudioConfigureHost();
+      // The clock's events are rebuilt on load: the block in flight ends at
+      // the same cycle the saved event had.
+      if (auto* clock = StaticRecompNativeClock::NativeClock::Instance(); clock && a.dma_event)
+      {
+        clock->Remove(a.dma_event);
+        if (a.dma_running)
+        {
+          const s64 end = static_cast<s64>(a.block_start) +
+                          static_cast<s64>(std::max<u32>(a.play_blocks, 1) * a.ticks_per_32_bytes);
+          clock->Schedule(end - static_cast<s64>(clock->Now()), a.dma_event);
+        }
+      }
       std::fprintf(stderr, "[native_audio] state loaded: native audio continues (DMA %s)\n",
                    a.dma_running ? "running" : "stopped");
     }
@@ -359,8 +330,8 @@ void NativeSdk::AudioHandleMail(u32 mail)
       break;
     case 0x80F3D001:
     {
-      const u8* code = m_system.GetMemory().GetPointerForRange(a.ucode_address, a.ucode_length);
-      a.ucode_crc = code ? Common::HashEctor(code, a.ucode_length) : 0;
+      const u8* code = StaticRecompGuestMemory::GuestMemory::Own().GetPointerForRange(a.ucode_address, a.ucode_length);
+      a.ucode_crc = code ? StaticRecompUtil::HashEctor(code, a.ucode_length) : 0;
       std::fprintf(stderr, "[native_audio] DSP task boots microcode crc=%08x (%s)\n", a.ucode_crc,
                    StaticRecompNativeAudio::NativeAxWii::SupportsCrc(a.ucode_crc) ?
                        "AXWii: native mixer" :
@@ -503,7 +474,7 @@ bool NativeSdk::AudioRun(CPUState& guest)
     const u8* p = Pointer(guest, address, 4);
     return p ? Load32(p) : 0u;
   };
-  auto& core_timing = m_system.GetCoreTiming();
+  auto* clock = StaticRecompNativeClock::NativeClock::Instance();
   switch (guest.pc)
   {
   case kOsInitAudioSystem:
@@ -513,8 +484,8 @@ bool NativeSdk::AudioRun(CPUState& guest)
     a.mails.clear();
     break;
   case kOsStopAudioSystem:
-    if (a.dma_running)
-      core_timing.RemoveEvent(a.dma_event);
+    if (a.dma_running && clock)
+      clock->Remove(a.dma_event);
     a.dma_running = false;
     a.dma_control &= 0x7FFF;
     a.dsp = AudioState::Dsp::Halted;
@@ -599,7 +570,7 @@ bool NativeSdk::AudioRun(CPUState& guest)
     u32 left = 0;
     if (a.dma_running && a.ticks_per_32_bytes)
     {
-      const u64 done = (core_timing.GetTicks() - a.block_start) / a.ticks_per_32_bytes;
+      const u64 done = clock ? (clock->Now() - a.block_start) / a.ticks_per_32_bytes : 0;
       left = done < a.play_blocks ? (a.play_blocks - static_cast<u32>(done)) * 32 : 0;
     }
     guest.gpr[3] = left;
@@ -625,10 +596,12 @@ void NativeSdk::AudioStartDma()
   // As the hardware does when the enable bit is set: latch the registers.
   a.play_address = ((u32(a.dma_hi) << 16) | a.dma_lo) & ~0x1Fu;
   a.play_blocks = a.dma_control & 0x7FFF;
-  a.block_start = m_system.GetCoreTiming().GetTicks();
+  auto* clock = StaticRecompNativeClock::NativeClock::Instance();
+  a.block_start = clock ? clock->Now() : 0;
   a.dma_running = true;
-  m_system.GetCoreTiming().ScheduleEvent(
-      static_cast<s64>(std::max<u32>(a.play_blocks, 1) * a.ticks_per_32_bytes), a.dma_event);
+  if (clock)
+    clock->Schedule(static_cast<s64>(std::max<u32>(a.play_blocks, 1) * a.ticks_per_32_bytes),
+                    a.dma_event);
 }
 
 void NativeSdk::AudioDmaEvent(s64 cycles_late)
@@ -639,12 +612,23 @@ void NativeSdk::AudioDmaEvent(s64 cycles_late)
   // The block just played goes to the host mixer (big-endian stereo s16).
   if (a.play_blocks)
   {
-    auto& memory = m_system.GetMemory();
+    const auto memory = StaticRecompGuestMemory::GuestMemory::Own();
     if (const u8* samples = memory.GetPointerForRange(a.play_address, a.play_blocks * 32))
     {
-      AudioCommon::SendAIBuffer(m_system, reinterpret_cast<const short*>(samples),
-                                a.play_blocks * 8);
+      // Our own output (shared mode) when the runtime registered one; muted otherwise.
+      if (HostAudioSink* sink = GetHostAudioSink())
+        sink->PushSamples(samples, a.play_blocks * 8);
       a.samples_out += a.play_blocks * 8;
+      static const u64 hash_limit = [] {
+        const char* value = std::getenv("MODERNGEKKO_AUDIO_HASH_SAMPLES");
+        return value ? std::strtoull(value, nullptr, 10) : 640000ull;
+      }();
+      for (u32 i = 0; i < a.play_blocks * 8 && a.output_hash_samples < hash_limit; ++i)
+      {
+        for (u32 b = 0; b < 4; ++b)
+          a.output_hash = (a.output_hash ^ samples[i * 4 + b]) * 0x100000001b3ull;
+        ++a.output_hash_samples;
+      }
     }
   }
   ++a.dma_blocks;
@@ -657,10 +641,12 @@ void NativeSdk::AudioDmaEvent(s64 cycles_late)
   // interrupt, as the hardware does at the end of a block.
   a.play_address = ((u32(a.dma_hi) << 16) | a.dma_lo) & ~0x1Fu;
   a.play_blocks = a.dma_control & 0x7FFF;
-  a.block_start = m_system.GetCoreTiming().GetTicks() - cycles_late;
-  m_system.GetCoreTiming().ScheduleEvent(
-      static_cast<s64>(std::max<u32>(a.play_blocks, 1) * a.ticks_per_32_bytes) - cycles_late,
-      a.dma_event);
+  auto* clock = StaticRecompNativeClock::NativeClock::Instance();
+  a.block_start = (clock ? clock->Now() : 0) - cycles_late;
+  if (clock)
+    clock->Schedule(static_cast<s64>(std::max<u32>(a.play_blocks, 1) * a.ticks_per_32_bytes) -
+                        cycles_late,
+                    a.dma_event);
   AudioPostInterrupt(CallbackKind::AiInterrupt);
 }
 
@@ -720,7 +706,7 @@ void NativeSdk::PrintAudioStats() const
   std::fprintf(stderr,
                "[native_audio] mode=%s active=%d abandoned=%d ucode=%08x command_lists=%llu "
                "errors=%llu dsp_interrupts=%llu ai_interrupts=%llu dma_blocks=%llu "
-               "samples_out=%llu unknown_mails=%llu pending=%u/%u verified=%llu mismatches=%llu\n",
+               "samples_out=%llu unknown_mails=%llu pending=%u/%u verified=%llu mismatches=%llu output_hash=%016llx/%llu\n",
                a.mode == AudioState::Mode::Native ? "native" :
                a.mode == AudioState::Mode::Verify ? "verify" :
                                                     "off",
@@ -733,6 +719,138 @@ void NativeSdk::PrintAudioStats() const
                static_cast<unsigned long long>(a.samples_out),
                static_cast<unsigned long long>(a.unknown_mails), a.pending_dsp_interrupts,
                a.pending_ai_interrupts, static_cast<unsigned long long>(a.verified),
-               static_cast<unsigned long long>(a.mismatches));
+               static_cast<unsigned long long>(a.mismatches),
+               static_cast<unsigned long long>(a.output_hash),
+               static_cast<unsigned long long>(a.output_hash_samples));
+}
+
+bool NativeSdk::AiRegisterRead(u32 ea, u8 size, u64* value)
+{
+  if (!m_audio)
+    return false;
+  AudioState& a = *m_audio;
+  if (a.mode != AudioState::Mode::Native || size != 4 || (ea & 0xFFFFFFF0u) != kAiRegisterBase)
+    return false;
+  if (!a.ai_regs_seeded)
+  {
+    if (!s_chassis.ai_seed || !s_chassis.ai_seed(a.ai_control, a.ai_volume, a.ai_interrupt_timing))
+    {
+      a.ai_control = kAiControlPowerOn;
+      a.ai_volume = 0;
+      a.ai_interrupt_timing = 0;
+    }
+    a.ai_regs_seeded = true;
+  }
+  switch (ea & 0xF)
+  {
+  case 0x0:
+    *value = a.ai_control;
+    return true;
+  case 0x4:
+    *value = a.ai_volume;
+    return true;
+  case 0x8:
+    // The AIS sample counter: disc audio streaming is not used by the game
+    // (PSTAT never set); it reads as the stopped counter.
+    *value = 0;
+    return true;
+  case 0xC:
+    *value = a.ai_interrupt_timing;
+    return true;
+  }
+  return false;
+}
+
+bool NativeSdk::AiRegisterWrite(u32 ea, u8 size, u64 value)
+{
+  if (!m_audio)
+    return false;
+  AudioState& a = *m_audio;
+  if (a.mode != AudioState::Mode::Native || size != 4 || (ea & 0xFFFFFFF0u) != kAiRegisterBase)
+    return false;
+  if (!a.ai_regs_seeded)
+  {
+    if (!s_chassis.ai_seed || !s_chassis.ai_seed(a.ai_control, a.ai_volume, a.ai_interrupt_timing))
+    {
+      a.ai_control = kAiControlPowerOn;
+      a.ai_volume = 0;
+      a.ai_interrupt_timing = 0;
+    }
+    a.ai_regs_seeded = true;
+  }
+  const u32 word = static_cast<u32>(value);
+  switch (ea & 0xF)
+  {
+  case 0x0:
+  {
+    // AICR: PSTAT, AISFR, AIINTMSK, AIINTVLD and AIDFR are state; writing 1
+    // to AIINT (bit 3) clears it; SCRESET (bit 5) is a pulse.
+    const u32 keep = 0x01u | 0x02u | 0x04u | 0x10u | 0x40u;
+    u32 control = (a.ai_control & ~keep) | (word & keep);
+    if (word & 0x08u)
+      control &= ~0x08u;
+    control &= ~0x20u;
+    a.ai_control = control;
+    return true;
+  }
+  case 0x4:
+    a.ai_volume = word & 0xFFFFu;
+    return true;
+  case 0x8:
+    return true;  // read-only counter
+  case 0xC:
+    a.ai_interrupt_timing = word;
+    return true;
+  }
+  return false;
+}
+namespace
+{
+constexpr u32 kDspControl = 0xCC00500Au;
+}  // namespace
+
+bool NativeSdk::DspControlRead(u32 ea, u8 size, u64* value)
+{
+  if (!m_audio)
+    return false;
+  AudioState& a = *m_audio;
+  if (a.mode != AudioState::Mode::Native || size != 2 || ea != kDspControl)
+    return false;
+  if (!a.dsp_control_seeded)
+  {
+    u16 control = 0;
+    a.dsp_control = s_chassis.dsp_control_seed && s_chassis.dsp_control_seed(control) ? control :
+                                                                                        kDspControlPowerOn;
+    a.dsp_control_seeded = true;
+  }
+  *value = a.dsp_control;
+  return true;
+}
+
+bool NativeSdk::DspControlWrite(u32 ea, u8 size, u64 value)
+{
+  if (!m_audio)
+    return false;
+  AudioState& a = *m_audio;
+  if (a.mode != AudioState::Mode::Native || size != 2 || ea != kDspControl)
+    return false;
+  if (!a.dsp_control_seeded)
+  {
+    u16 control = 0;
+    a.dsp_control = s_chassis.dsp_control_seed && s_chassis.dsp_control_seed(control) ? control :
+                                                                                        kDspControlPowerOn;
+    a.dsp_control_seeded = true;
+  }
+  // As the chassis: the interrupt flags (AID 0x08, ARAM 0x20, DSP 0x80) clear
+  // when written with 1, DMAState (0x200) is read-only, the reset (0x01) is a
+  // pulse the DSP (native) completes at once; the rest is state.
+  const u16 word = static_cast<u16>(value);
+  constexpr u16 kInts = 0x08 | 0x20 | 0x80;
+  constexpr u16 kReadOnly = 0x200;
+  u16 control = a.dsp_control;
+  control = (control & (kInts | kReadOnly)) | (word & ~(kInts | kReadOnly | 0x01));
+  control &= ~(word & kInts);
+  a.dsp_control = control;
+  return true;
 }
 }  // namespace StaticRecompNativeSdk

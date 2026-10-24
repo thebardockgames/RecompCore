@@ -198,6 +198,8 @@ static const char* Debug_GetInterruptName(u32 cause_mask)
 
 void ProcessorInterfaceManager::SetInterrupt(u32 cause_mask, bool set)
 {
+  if (m_native_interrupt_hook && m_native_interrupt_hook(cause_mask, set))
+    return;
   DEBUG_ASSERT_MSG(POWERPC, Core::IsCPUThread(), "SetInterrupt from wrong thread");
 
   if (set && !(m_interrupt_cause & cause_mask))

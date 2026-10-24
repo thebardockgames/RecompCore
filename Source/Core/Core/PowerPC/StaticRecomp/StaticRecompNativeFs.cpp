@@ -19,54 +19,27 @@
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeFs.h"
 
 #include <algorithm>
+#include <optional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
-#include "Common/ChunkFile.h"
-#include "Core/HW/Memmap.h"
-#include "Core/IOS/FS/FileSystem.h"
-#include "Core/IOS/IOS.h"
-#include "Core/System.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompStateStream.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompGuestMemory.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompFsTypes.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeNand.h"
 
 namespace StaticRecompNativeSdk
 {
 namespace
 {
-using IOS::HLE::FS::ResultCode;
-namespace FS = IOS::HLE::FS;
+using StaticRecompFs::ResultCode;
+namespace FS = StaticRecompFs;
 
-constexpr u32 kSda = 0x806370A0;
-constexpr u32 kIosOpenAsync = 0x802502E0;
-constexpr u32 kIosOpen = 0x802503F8;
-constexpr u32 kIosCloseAsync = 0x80250518;
-constexpr u32 kIosClose = 0x802505D8;
-constexpr u32 kIosReadAsync = 0x80250680;
-constexpr u32 kIosWriteAsync = 0x80250888;
-constexpr u32 kIosSeekAsync = 0x80250A90;
-constexpr u32 kIosIoctlAsync = 0x80250B70;
-constexpr u32 kIosIoctl = 0x80250CA8;
-constexpr u32 kIosIoctlvAsync = 0x80250F14;
-constexpr u32 kIosIoctlv = 0x80250FF8;
+#include "native/fs.inc"  // the game's addresses and fingerprints
 
-constexpr u32 kHooks[] = {kIosOpenAsync,  kIosOpen,       kIosCloseAsync, kIosClose,
-                          kIosReadAsync,  kIosWriteAsync, kIosSeekAsync,  kIosIoctlAsync,
-                          kIosIoctl,      kIosIoctlvAsync, kIosIoctlv};
 
-constexpr std::array<CodeFingerprint, 11> kIpcCode = {{
-    {0x802502E0u, 0x118u, 0xC46CF411D115CE94ull},  // IOS_OpenAsync
-    {0x802503F8u, 0x120u, 0x670F4D0C9C40761Cull},  // IOS_Open
-    {0x80250518u, 0xC0u, 0x82AE39E63280ADD2ull},   // IOS_CloseAsync
-    {0x802505D8u, 0xA8u, 0x190B6453C2680784ull},   // IOS_Close
-    {0x80250680u, 0x100u, 0x2377494864F42071ull},  // IOS_ReadAsync
-    {0x80250888u, 0x100u, 0x60A2CD17AD6F5B33ull},  // IOS_WriteAsync
-    {0x80250A90u, 0xE0u, 0x38689100D2FC80E2ull},   // IOS_SeekAsync
-    {0x80250B70u, 0x138u, 0xE8D5D52C3BF58D26ull},  // IOS_IoctlAsync
-    {0x80250CA8u, 0x130u, 0x8E91692490B416B2ull},  // IOS_Ioctl
-    {0x80250F14u, 0xE4u, 0x7149E1F615C3FF21ull},   // IOS_IoctlvAsync
-    {0x80250FF8u, 0xDCu, 0x0B406068E7BAEC1Eull},   // IOS_Ioctlv
-}};
 
 // ISFS ioctls (Core/IOS/FS/FileSystemProxy.h).
 enum : u32
@@ -98,11 +71,11 @@ u64 Fnv1a(const u8* data, u32 size)
 
 s32 Convert(ResultCode code)
 {
-  return static_cast<s32>(FS::ConvertResult(code));
+  return FS::ConvertResult(code);
 }
 
 // Whether a guest address range is backed by MEM1/MEM2 (no panic dialogs).
-bool ValidRange(Memory::MemoryManager& memory, u32 address, u32 size)
+bool ValidRange(const StaticRecompGuestMemory::GuestMemory& memory, u32 address, u32 size)
 {
   const u32 physical = address & 0x3FFFFFFF;
   if (u64(physical) + size <= memory.GetRamSizeReal())
@@ -111,7 +84,7 @@ bool ValidRange(Memory::MemoryManager& memory, u32 address, u32 size)
          u64(physical & 0x0FFFFFFF) + size <= memory.GetExRamSizeReal();
 }
 
-std::string ReadString(Memory::MemoryManager& memory, u32 address, u32 max)
+std::string ReadString(const StaticRecompGuestMemory::GuestMemory& memory, u32 address, u32 max)
 {
   std::string result;
   for (u32 i = 0; i < max && ValidRange(memory, address + i, 1); ++i)
@@ -122,6 +95,36 @@ std::string ReadString(Memory::MemoryManager& memory, u32 address, u32 max)
     result.push_back(c);
   }
   return result;
+}
+
+// The IOS devices answered natively besides /dev/fs (see IpcDeviceKind).
+std::optional<IpcDeviceKind> VirtualDeviceKind(const std::string& path)
+{
+  using Kind = IpcDeviceKind;
+  if (path == "/dev/stm/immediate") return Kind::StmImmediate;
+  if (path == "/dev/stm/eventhook") return Kind::StmEventHook;
+  if (path == "/dev/es") return Kind::Es;
+  if (path == "/dev/net/kd/request") return Kind::KdRequest;
+  if (path == "/dev/net/kd/time") return Kind::KdTime;
+  if (path == "/dev/di") return Kind::Di;
+  return std::nullopt;
+}
+
+const char* KindName(IpcDeviceKind kind)
+{
+  using Kind = IpcDeviceKind;
+  switch (kind)
+  {
+  case Kind::File: return "file";
+  case Kind::Fs: return "/dev/fs";
+  case Kind::StmImmediate: return "/dev/stm/immediate";
+  case Kind::StmEventHook: return "/dev/stm/eventhook";
+  case Kind::Es: return "/dev/es";
+  case Kind::KdRequest: return "/dev/net/kd/request";
+  case Kind::KdTime: return "/dev/net/kd/time";
+  case Kind::Di: return "/dev/di";
+  }
+  return "?";
 }
 
 bool IsNandPath(const std::string& path)
@@ -140,6 +143,12 @@ bool NativeSdk::FsBind(const std::function<bool(u32)>& enable, bool wanted)
     std::fprintf(stderr, "[native_fs] needs native interrupts and the context call hook: disabled\n");
     return false;
   }
+  if (GetNandRoot().empty())
+  {
+    std::fprintf(stderr, "[native_fs] no NAND root given by the runtime: disabled\n");
+    return false;
+  }
+  m_nand = std::make_unique<StaticRecompNativeNand::NandStore>(GetNandRoot());
   for (u32 address : kHooks)
   {
     if (!enable(address))
@@ -150,6 +159,7 @@ bool NativeSdk::FsBind(const std::function<bool(u32)>& enable, bool wanted)
   }
   m_fs = std::make_unique<FsState>();
   std::fprintf(stderr, "[native_fs] NAND file system: %zu IPC hooks\n", std::size(kHooks));
+  s_ipc_native = true;
   return true;
 }
 
@@ -160,7 +170,13 @@ bool NativeSdk::FsRun(CPUState& guest)
     return false;
   if (!fs.active)
   {
-    bool ok = guest.gpr[13] == kSda && m_system.GetIOS() != nullptr;
+    // The chassis's IOS kernel is not needed: the title identity comes from
+    // the native boot (or, under the chassis's boot, from that kernel).
+    u32 uid = 0;
+    u16 gid = 0;
+    bool ok = guest.gpr[13] == kSda && m_nand != nullptr &&
+              (GetTitleIdentity(&uid, &gid) ||
+               (s_chassis.ios_title_identity && s_chassis.ios_title_identity(&uid, &gid)));
     for (const auto& code : kIpcCode)
     {
       const u8* p = Pointer(guest, code.address, code.size);
@@ -179,9 +195,8 @@ bool NativeSdk::FsRun(CPUState& guest)
     fs.active = true;
   }
 
-  auto& memory = m_system.GetMemory();
-  IOS::HLE::EmulationKernel& ios = *m_system.GetIOS();
-  const std::shared_ptr<FS::FileSystem> file_system = ios.GetFS();
+  const StaticRecompGuestMemory::GuestMemory memory(guest);
+  StaticRecompNativeNand::NandStore* const file_system = m_nand.get();  // own store, not IOS
   const auto handle_of = [&](u32 fd) -> FsState::Handle* {
     const auto it = fs.handles.find(fd);
     return it == fs.handles.end() ? nullptr : &it->second;
@@ -220,7 +235,8 @@ bool NativeSdk::FsRun(CPUState& guest)
     const std::string path = ReadString(memory, guest.gpr[3], 64);
     // A native descriptor completes async calls through native interrupts:
     // before the OS takes them, the original keeps this handle.
-    if (!IsNandPath(path) || !InstallNativeInterrupt(guest))
+    const std::optional<IpcDeviceKind> virtual_kind = VirtualDeviceKind(path);
+    if ((!IsNandPath(path) && !virtual_kind) || !InstallNativeInterrupt(guest))
     {
       if (++fs.opens_original <= 24)
         std::fprintf(stderr, "[native_fs] open %s mode %u: original IOS\n", path.c_str(),
@@ -234,8 +250,19 @@ bool NativeSdk::FsRun(CPUState& guest)
       std::fprintf(stderr, "[native_fs] open %s mode %u\n", path.c_str(), guest.gpr[4] & 3);
     }
     FsState::Handle handle;
-    handle.uid = ios.GetUidForPPC();
-    handle.gid = ios.GetGidForPPC();
+    // The title's uid and group: from the native boot (as ES assigns them)
+    // or, under the chassis's boot, from its IOS title context.
+    u32 title_uid = 0;
+    u16 title_gid = 0;
+    if (GetTitleIdentity(&title_uid, &title_gid))
+    {
+      handle.uid = title_uid;
+      handle.gid = title_gid;
+    }
+    else if (s_chassis.ios_title_identity)
+    {
+      s_chassis.ios_title_identity(&handle.uid, &handle.gid);
+    }
     std::strncpy(handle.path.data(), path.c_str(), handle.path.size() - 1);
     s32 result;
     if (fs.handles.size() >= 16)
@@ -245,6 +272,14 @@ bool NativeSdk::FsRun(CPUState& guest)
     else if (path == "/dev/fs")
     {
       handle.device = true;
+      handle.kind = IpcDeviceKind::Fs;
+      result = static_cast<s32>(fs.next_fd);
+    }
+    else if (virtual_kind)
+    {
+      handle.device = true;
+      handle.kind = *virtual_kind;
+      ++fs.virtual_opens;
       result = static_cast<s32>(fs.next_fd);
     }
     else
@@ -253,7 +288,7 @@ bool NativeSdk::FsRun(CPUState& guest)
                                           static_cast<FS::Mode>(guest.gpr[4] & 3));
       if (opened)
       {
-        handle.fs_fd = opened->Release();
+        handle.fs_fd = *opened;
         result = static_cast<s32>(fs.next_fd);
       }
       else
@@ -350,6 +385,54 @@ bool NativeSdk::FsRun(CPUState& guest)
                        static_cast<FS::Mode>(memory.Read_U8(in + 72))};
     };
     const auto params_attribute = [&] { return memory.Read_U8(in + 73); };
+    if (handle->kind != IpcDeviceKind::File && handle->kind != IpcDeviceKind::Fs)
+    {
+      ++fs.virtual_calls;
+      switch (handle->kind)
+      {
+      case IpcDeviceKind::StmImmediate:
+        // IOCTL_STM_VIDIMMING (0x5001) and IOCTL_STM_LEDMODE (0x6002): nothing
+        // to dim or light on a PC; Dolphin answers IPC_SUCCESS for every STM
+        // immediate request too.
+        result = 0;
+        break;
+      case IpcDeviceKind::StmEventHook:
+        // IOCTL_STM_EVENTHOOK (0x1000) waits for the reset or power button,
+        // which the port never presses: the request stays pending forever.
+        if (request == 0x1000 && is_async)
+        {
+          ++fs.virtual_pending;
+          guest.gpr[3] = 0;  // IPC_OK: request queued
+          guest.pc = guest.lr;
+          guest.downcount -= kFsCycles;
+          return true;
+        }
+        result = request == 0x1000 ? -17 /* IPC_EEXIST */ : -4 /* IPC_EINVAL */;
+        break;
+      case IpcDeviceKind::KdTime:
+        // IOCTL_NW24_SET_RTC_COUNTER (0x17): Dolphin stores the counter and
+        // writes a zero common result to the output buffer.
+        if (request == 0x17 && out_ok && out_size >= 4)
+        {
+          memory.Write_U32(0, out);
+          result = 0;
+        }
+        else
+        {
+          ++fs.virtual_unknown;
+          result = -4;
+        }
+        break;
+      default:
+        ++fs.virtual_unknown;
+        result = -4;
+        break;
+      }
+      if (result < 0 && fs.virtual_unknown <= 8)
+        std::fprintf(stderr, "[native_fs] %s ioctl 0x%X unsupported natively -> %d\n",
+                     KindName(handle->kind), request, result);
+      return finish(result, is_async ? guest.gpr[9] : 0, is_async ? guest.gpr[10] : 0, is_async);
+    }
     if (!handle->device)
     {
       if (request == ISFS_IOCTL_GETFILESTATS && out_ok && out_size >= 8)
@@ -479,6 +562,40 @@ bool NativeSdk::FsRun(CPUState& guest)
                                   return false;
                               return true;
                             }();
+    if (handle->kind != IpcDeviceKind::File && handle->kind != IpcDeviceKind::Fs)
+    {
+      ++fs.virtual_calls;
+      // The running title: 00010000-<game id> for a disc game.
+      const u64 title_id = (0x00010000ull << 32) | memory.Read_U32(0x80000000);
+      if (handle->kind == IpcDeviceKind::Es && vectors_ok && request == 0x20 /* GETTITLEID */ &&
+          in_count == 0 && io_count == 1 && vec_size(0) >= 8)
+      {
+        memory.Write_U64(title_id, vec_addr(0));
+        result = 0;
+      }
+      else if (handle->kind == IpcDeviceKind::Es && vectors_ok && request == 0x1D /* GETTITLEDIR */ &&
+               in_count == 1 && io_count == 1 && vec_size(0) >= 8)
+      {
+        const u64 asked = memory.Read_U64(vec_addr(0));
+        char path[64];
+        const int length = std::snprintf(path, sizeof(path), "/title/%08x/%08x/data",
+                                         static_cast<u32>(asked >> 32), static_cast<u32>(asked));
+        if (length > 0 && vec_size(1) >= static_cast<u32>(length))
+        {
+          memory.CopyToEmu(vec_addr(1), path, static_cast<size_t>(length));
+          result = 0;
+        }
+      }
+      else
+      {
+        ++fs.virtual_unknown;
+        result = -4;
+      }
+      if (result < 0 && fs.virtual_unknown <= 8)
+        std::fprintf(stderr, "[native_fs] %s ioctlv 0x%X unsupported natively -> %d\n",
+                     KindName(handle->kind), request, result);
+      return finish(result, is_async ? guest.gpr[8] : 0, is_async ? guest.gpr[9] : 0, is_async);
+    }
     if (handle->device && vectors_ok && request == ISFS_IOCTLV_READDIR && in_count >= 1 &&
         in_count == io_count && in_count <= 2 && vec_size(0) == 64)
     {
@@ -557,7 +674,7 @@ bool NativeSdk::FsRun(CPUState& guest)
   }
 }
 
-void NativeSdk::FsDoState(PointerWrap& p)
+void NativeSdk::FsDoState(StaticRecompState::StateStream& p, u32 version)
 {
   FsState& fs = *m_fs;
   p.Do(fs.active);
@@ -580,12 +697,68 @@ void NativeSdk::FsDoState(PointerWrap& p)
     }
     p.Do(fd);
     p.Do(handle.device);
+    if (version >= 3)
+      p.Do(handle.kind);
+    else if (p.IsReadMode())
+      handle.kind = handle.device ? IpcDeviceKind::Fs : IpcDeviceKind::File;
     p.Do(handle.fs_fd);
     p.Do(handle.uid);
     p.Do(handle.gid);
     p.Do(handle.path);
     if (p.IsReadMode())
       fs.handles[fd] = handle;
+  }
+  if (!m_nand)
+    return;
+  if (version >= 6)
+  {
+    for (u32 fd = 0; fd < StaticRecompNativeNand::NandStore::kMaxHandles; ++fd)
+    {
+      StaticRecompNativeNand::NandStore::HandleState state = m_nand->GetHandleState(fd);
+      u8 mode = static_cast<u8>(state.mode);
+      p.Do(state.opened);
+      p.Do(state.path);
+      p.Do(mode);
+      p.Do(state.offset);
+      if (p.IsReadMode())
+      {
+        state.mode = static_cast<StaticRecompNativeNand::Mode>(mode);
+        if (!m_nand->RestoreHandle(fd, state) && state.opened)
+          std::fprintf(stderr, "[native_fs] state handle %u (%s) could not be reopened\n", fd,
+                       state.path.c_str());
+      }
+    }
+  }
+  else if (p.IsReadMode())
+  {
+    // A state from before the own store: its file descriptors index Dolphin's
+    // IOS file system, which the HW chunk restored. Re-open each file through
+    // the store at the same offset (mode unknown there: read/write).
+    m_nand->CloseAll();
+    for (auto& [fd, handle] : fs.handles)
+    {
+      if (handle.device)
+        continue;
+      // The chassis's store reopened the host file with write-deny sharing
+      // when the HW chunk was restored; the hook closes it before the own
+      // store opens the same file, or fopen("r+b") fails.
+      u32 offset = 0;
+      if (s_chassis.migrate_fs_handle)
+        offset = s_chassis.migrate_fs_handle(handle.fs_fd).value_or(0);
+      StaticRecompNativeNand::NandStore::HandleState state;
+      state.opened = true;
+      state.path = handle.path.data();
+      state.mode = StaticRecompNativeNand::Mode::ReadWrite;
+      state.offset = offset;
+      u32 slot = 0;
+      while (slot < StaticRecompNativeNand::NandStore::kMaxHandles && m_nand->GetHandleState(slot).opened)
+        ++slot;
+      if (slot < StaticRecompNativeNand::NandStore::kMaxHandles && m_nand->RestoreHandle(slot, state))
+        handle.fs_fd = slot;
+      else
+        std::fprintf(stderr, "[native_fs] old state handle %u (%s) could not be migrated\n", fd,
+                     handle.path.data());
+    }
   }
 }
 
@@ -607,5 +780,11 @@ void NativeSdk::PrintFsStats() const
                static_cast<unsigned long long>(fs.read_bytes),
                static_cast<unsigned long long>(fs.written_bytes),
                static_cast<unsigned long long>(fs.errors), fs.handles.size());
+  std::fprintf(stderr,
+               "[native_fs] virtual devices: opens=%llu calls=%llu pending=%llu unsupported=%llu\n",
+               static_cast<unsigned long long>(fs.virtual_opens),
+               static_cast<unsigned long long>(fs.virtual_calls),
+               static_cast<unsigned long long>(fs.virtual_pending),
+               static_cast<unsigned long long>(fs.virtual_unknown));
 }
 }  // namespace StaticRecompNativeSdk

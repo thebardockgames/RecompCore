@@ -124,6 +124,10 @@ bool Init(Core::System& system, std::unique_ptr<BootParameters> boot, const Wind
 void Stop(Core::System& system);
 void Shutdown(Core::System& system);
 
+// RecompCore (phase S): the port's emulation thread (StaticRecompHostLoop)
+// mirrors its process state here for the chassis paths that still read it.
+void NativeSetCoreState(State state);
+
 void DeclareAsCPUThread();
 void UndeclareAsCPUThread();
 void DeclareAsGPUThread();

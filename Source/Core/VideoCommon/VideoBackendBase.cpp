@@ -3,6 +3,7 @@
 
 #include "VideoCommon/VideoBackendBase.h"
 #include "VideoCommon/VideoEvents.h"
+#include "VideoCommon/NativeGXBridge.h"
 
 #include <algorithm>
 #include <cstring>
@@ -313,6 +314,8 @@ bool VideoBackendBase::InitializeShared(std::unique_ptr<AbstractGfx> gfx,
 
   // do not initialize again for the config window
   m_initialized = true;
+  // Phase S: the native GX host is the port's; the chassis lends it its hooks.
+  NativeGXBridge::InstallChassisAdapter();
 
   g_gfx = std::move(gfx);
   g_vertex_manager = std::move(vertex_manager);

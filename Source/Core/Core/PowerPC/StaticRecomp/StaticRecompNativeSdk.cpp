@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeSdk.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompCpuHost.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeBat.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeClock.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativePi.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeAudio.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeFs.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeMods.h"
@@ -15,49 +19,18 @@
 #include <string>
 #include <stdexcept>
 
-#include "Common/ChunkFile.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompStateStream.h"
 
-#include "Common/Swap.h"
-#include "Core/HW/GCPad.h"
-#include "Core/HW/ProcessorInterface.h"
-#include "Core/HW/SI/SI.h"
-#include "Core/HW/SI/SI_Device.h"
-#include "Core/HW/SystemTimers.h"
-#include "Core/PowerPC/MMU.h"
-#include "Core/System.h"
-#include "InputCommon/GCPadStatus.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompHostInput.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeNand.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeWud.h"
 
 namespace StaticRecompNativeSdk
 {
 namespace
 {
-// RDSE70 (Budokai Tenkaichi 3, NTSC-U). Addresses come from the SDK code of
-// that DOL; CodeMatches() checks the code still has the original bytes.
-constexpr u32 kSda = 0x806370A0;  // r13
-constexpr u32 kPadRead = 0x8021FAB8;
-constexpr u32 kSpec2MakeStatus = 0x80220080;
+#include "native/sdk.inc"  // the game's addresses and fingerprints
 
-// pad.a globals (r13-relative in the SDK code).
-constexpr u32 kPendingBits = kSda - 25408;
-constexpr u32 kCheckingBits = kSda - 25404;
-constexpr u32 kResettingBits = kSda - 25392;
-constexpr u32 kEnabledBits = kSda - 25388;
-constexpr u32 kBarrelBits = kSda - 25412;
-constexpr u32 kResettingChan = kSda - 32356;
-constexpr u32 kAnalogMode = kSda - 32348;
-constexpr u32 kMakeStatus = kSda - 32340;
-constexpr u32 kSiIdleCount = kSda - 25488;  // cleared by __VIResetSIIdle
-constexpr u32 kOrigin = 0x805658D0;         // PADStatus Origin[4]
-constexpr u32 kPadType = 0x80565900;        // u32 Type[4]
-constexpr u32 kPadPrevious = 0x80565920;    // PADStatus previous[4]
-// si.a globals.
-constexpr u32 kSiPacketChan = 0x805807D0;   // Packet[chan].chan, stride 32
-constexpr u32 kSiChan = 0x80391170;         // Si.chan
-constexpr u32 kSiPoll = 0x80391174;         // Si.poll
-constexpr u32 kSiType = 0x80391188;         // u32 Type[4]
-constexpr u32 kSiTypeTime = 0x80580870;     // OSTime TypeTime[4]
-constexpr u32 kSiInputBuffer = 0x80580950;  // u32 InputBuffer[4][2]
-constexpr u32 kSiInputValid = 0x80580970;   // BOOL InputBufferValid[4]
 
 constexpr u32 kSiErrorNoResponse = 0x08;
 constexpr u32 kSiNewData = 0x20;
@@ -67,22 +40,11 @@ constexpr u16 kPadOriginRequest = 0x2000;
 // Approximate cost of the replaced SDK path, charged to keep CoreTiming moving.
 constexpr s64 kPadReadCycles = 600;
 
-// kpad.a / wpad.a.
-constexpr u32 kKpadRead = 0x80258F94;
-constexpr u32 kKpadStates = 0x8058B2A0;      // per-channel KPAD state, stride 1316
 constexpr u32 kKpadStateSize = 1316;
-constexpr u32 kWpadControlBlocks = 0x8058C770;  // WPAD control block pointer per channel
 constexpr u32 kWpadStatusOffset = 2236;        // s32 status (-1: no controller)
 constexpr u32 kWpadExtensionCallbackOffset = 2216;
-constexpr u32 kKpadExtensionCallback = 0x80259AD4;  // KPAD's WPAD extension callback
 constexpr s64 kKpadReadCycles = 300;
 
-// dvd.a: reads complete at once from the extracted files (like a ROM DMA in
-// N64 recomp ports) instead of going through the emulated drive.
-constexpr u32 kDvdReadAbsAsyncPrio = 0x80217678;
-constexpr u32 kDvdGetCommandBlockStatus = 0x80217834;
-constexpr u32 kDvdCbForReadAsync = 0x80213AF0;  // calls DVDFileInfo::callback if set
-constexpr u32 kDvdCbForReadSync = 0x80213C30;   // wakes threads sleeping in DVDReadPrio
 constexpr u32 kFstPointer = 0x80000038;         // OS globals: FST in memory
 constexpr u32 kPpcBlr = 0x4E800020;
 constexpr s64 kDvdReadCycles = 400;
@@ -92,15 +54,13 @@ constexpr u32 kBlockCommand = 8, kBlockState = 12, kBlockOffset = 16, kBlockLeng
               kFileInfoCallback = 56;
 
 std::string s_game_root;
+std::string s_nand_root;
+bool s_title_identity_set = false;
+u32 s_title_uid = 0;
+u16 s_title_gid = 0;
 
-// Native interrupt line (see NativeSdk::PostCallback).
-constexpr u32 kNativeInterruptHandler = 0x80246EC8;  // TRKNubMainLoop: debugger only
-// Return address of native context calls: TRKGetNextEvent, only called by
-// TRKNubMainLoop, which never runs either.
-constexpr u32 kNativeCallReturn = 0x802470DC;
 // SDK interrupt handler frame: OSContext at +8.
 constexpr u32 kContextFrame = 0x2E0;
-constexpr u32 kOsInterruptHandlerTable = kSda - 25992;  // pointer to the handler table
 constexpr u32 kOsInterruptMask = 0x800000C4;
 constexpr u32 kOsUserInterruptMask = 0x800000C8;
 constexpr u32 kNativeInterrupt = 25;  // __OS_INTERRUPT_PI_DEBUG
@@ -108,36 +68,6 @@ constexpr u32 kNativeInterruptBit = 0x80000000u >> kNativeInterrupt;
 constexpr u32 kViInterrupt = 24;  // __OS_INTERRUPT_PI_VI
 constexpr u32 kIpcInterrupt = 27;  // __OS_INTERRUPT_PI_ACR (IPC), installed by IPCCltInit
 
-// PADRead and every routine whose effect it reproduces (FNV-1a 64 of the
-// original DOL bytes).
-constexpr std::array<CodeFingerprint, 7> kPadReadCode = {{
-    {0x8021FAB8u, 736u, 0xE29BD7CAD6F7242Dull},   // PADRead
-    {0x80220080u, 1408u, 0x738BBC6D95C958DDull},  // SPEC2_MakeStatus
-    {0x8021CC18u, 16u, 0xEDA382FD2139495Bull},    // __VIResetSIIdle
-    {0x80245884u, 56u, 0x97723B6A5E0FC38Full},    // SIIsChanBusy
-    {0x8024636Cu, 120u, 0xFAA4BFDE3C9F80D0ull},   // SIGetStatus
-    {0x80246558u, 292u, 0x5043DAD0B5189B9Cull},   // SIGetResponse
-    {0x80246B24u, 436u, 0x8C9B8D5CFE6CF893ull},   // SIGetType
-}};
-// FirstRun_Main (0x8019EF50) shows the wrist strap screen (0x8019E6F0, 1200
-// frames) and the controller notice (0x8019EB2C, 600 frames) before the save
-// check; neither result is used.
-constexpr u32 kStrapScreen = 0x8019E6F0, kStrapScreenReturn = 0x8019F010;
-constexpr u32 kNoticeScreen = 0x8019EB2C, kNoticeScreenReturn = 0x8019F034;
-constexpr std::array<CodeFingerprint, 1> kFirstRunCode = {{
-    {0x8019EF50u, 296u, 0x8DD6FF5950D0E6A4ull},  // FirstRun_Main
-}};
-constexpr std::array<CodeFingerprint, 3> kKpadReadCode = {{
-    {0x80258F94u, 1816u, 0xC9D9811811C6C749ull},  // KPADRead
-    {0x8025CF34u, 140u, 0x26A5987C1C4B5155ull},   // WPADProbe
-    {0x8025CFC0u, 104u, 0xBF40E5F9C0F7C07Eull},   // WPADSetExtensionCallback
-}};
-constexpr std::array<CodeFingerprint, 4> kDvdReadCode = {{
-    {0x80217678u, 228u, 0x3E6440DD66B859FCull},   // DVDReadAbsAsyncPrio
-    {0x80213AF0u, 24u, 0x0D6079C9AA14B3F0ull},    // cbForReadAsync
-    {0x80213C30u, 8u, 0x305F319A5DA69584ull},     // cbForReadSync
-    {0x80217834u, 200u, 0x9A1401310802F6F8ull},   // DVDGetCommandBlockStatus
-}};
 
 u64 Fnv1a(const u8* data, u32 size)
 {
@@ -188,12 +118,43 @@ void SetGameRoot(const std::string& path)
   s_game_root = path;
 }
 
+void SetNandRoot(const std::string& path)
+{
+  s_nand_root = path;
+}
+
+const std::string& GetNandRoot()
+{
+  return s_nand_root;
+}
+
 const std::string& GameRoot()
 {
   return s_game_root;
 }
 
-NativeSdk::NativeSdk(Core::System& system) : m_system(system)
+void SetTitleIdentity(u32 uid, u16 gid)
+{
+  s_title_identity_set = true;
+  s_title_uid = uid;
+  s_title_gid = gid;
+}
+
+bool GetTitleIdentity(u32* uid, u16* gid)
+{
+  if (!s_title_identity_set)
+    return false;
+  *uid = s_title_uid;
+  *gid = s_title_gid;
+  return true;
+}
+
+void NativeSdk::SetChassisHooks(ChassisHooks hooks)
+{
+  s_chassis = std::move(hooks);
+}
+
+NativeSdk::NativeSdk()
 {
 }
 
@@ -205,7 +166,7 @@ NativeSdk::~NativeSdk()
 
 void NativeSdk::TraceCallEntry(const CPUState& guest)
 {
-  const u64 now = m_system.GetSystemTimers().GetFakeTimeBase();
+  const u64 now = StaticRecompNativeClock::NativeClock::CurrentTimeBase();
   std::fprintf(m_trace_file, "call,%08x,%llu,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n", guest.pc,
                static_cast<unsigned long long>(now), guest.gpr[3], guest.gpr[4], guest.gpr[5],
                guest.gpr[6], guest.gpr[7], guest.gpr[8], guest.lr);
@@ -223,7 +184,7 @@ void NativeSdk::TraceReturns(const CPUState& guest)
     const TraceCall& call = m_trace_calls[i];
     if (guest.pc != call.lr || guest.gpr[1] != call.sp)
       continue;
-    const u64 now = m_system.GetSystemTimers().GetFakeTimeBase();
+    const u64 now = StaticRecompNativeClock::NativeClock::CurrentTimeBase();
     std::fprintf(m_trace_file, "return,%08x,%llu,%08x,%llu\n", call.pc,
                  static_cast<unsigned long long>(now), guest.gpr[3],
                  static_cast<unsigned long long>(now - call.timebase));
@@ -242,6 +203,8 @@ void NativeSdk::Bind(u32 count, const u32* addresses, u8* flags, int* any)
     return;
   }
   m_verify = std::getenv("MODERNGEKKO_NATIVE_SDK_VERIFY") != nullptr;
+  m_hook_addresses = addresses;
+  m_hook_count = count;
   const auto wanted = [&](const char* name) {
     return names == "all" || ("," + names + ",").find(std::string(",") + name + ",") != std::string::npos;
   };
@@ -260,7 +223,10 @@ void NativeSdk::Bind(u32 count, const u32* addresses, u8* flags, int* any)
   };
   m_pad_read = enable(kPadRead, "PADRead");
   m_kpad_read = enable(kKpadRead, "KPADRead");
+  m_si_set_xy = wanted("PAD") && !m_verify && enable(kSiSetXY, "SISetXY");
+  m_si_get_type = m_si_set_xy && enable(kSiGetType, "SIGetType (from SIInit)");
   PadBind([&](u32 address) { return enable(address, "PAD"); }, wanted("PAD"));
+  WudBind([&](u32 address) { return enable(address, "WUD"); }, wanted("WUD"));
   m_dvd_read = !s_game_root.empty() && enable(kDvdReadAbsAsyncPrio, "DVDRead");
   AudioBind([&](u32 address) { return enable(address, "Audio"); }, wanted("Audio"));
   // The native interrupt handler entry must exit to the dispatcher.
@@ -367,7 +333,17 @@ bool NativeSdk::RunSlow(CPUState& guest)
   }
   if (guest.pc == kKpadRead && m_kpad_read)
     return KpadRead(guest);
+  if (guest.pc == kSiSetXY && m_si_set_xy && m_pad)
+  {
+    guest.pc = guest.lr;
+    guest.downcount -= 20;
+    return true;
+  }
+  if (guest.pc == kSiGetType && m_si_get_type && m_pad && SiInitGetType(guest))
+    return true;
   if (m_mods_hooks && ModsRun(guest))
+    return true;
+  if (m_wud && WudRun(guest))
     return true;
   if (m_skip_notices && SkipNotice(guest))
     return true;
@@ -385,14 +361,14 @@ u8* NativeSdk::Pointer(const CPUState& guest, u32 address, u32 size) const
   // Data translation through the DBATs, as the guest sees it.
   if ((guest.msr & 0x10) == 0 || u64(address) + size > 0x100000000ull)
     return nullptr;
-  constexpr u32 page_mask = PowerPC::BAT_PAGE_SIZE - 1;
-  if ((address & page_mask) + size > PowerPC::BAT_PAGE_SIZE)
+  constexpr u32 page_mask = StaticRecompNativeBat::kPageSize - 1;
+  if ((address & page_mask) + size > StaticRecompNativeBat::kPageSize)
     return nullptr;
-  const u32 bat = m_system.GetMMU().GetDBATTable()[address >> PowerPC::BAT_INDEX_SHIFT];
-  constexpr u32 mapped = PowerPC::BAT_MAPPED_BIT | PowerPC::BAT_PHYSICAL_BIT;
-  if ((bat & (mapped | PowerPC::BAT_WI_BIT)) != mapped)
+  const u32 bat = StaticRecompCpuHost::g_cpu_host->Dbat(address);
+  constexpr u32 mapped = StaticRecompNativeBat::kMapped | StaticRecompNativeBat::kPhysical;
+  if ((bat & (mapped | StaticRecompNativeBat::kWi)) != mapped)
     return nullptr;
-  const u32 physical = (bat & PowerPC::BAT_RESULT_MASK) | (address & page_mask);
+  const u32 physical = (bat & StaticRecompNativeBat::kResultMask) | (address & page_mask);
   if (guest.ram && u64(physical) + size <= guest.ram_size)
     return guest.ram + physical;
   if (physical >= 0x10000000 && guest.exram && u64(physical - 0x10000000) + size <= guest.exram_size)
@@ -421,6 +397,8 @@ bool NativeSdk::CodeMatches(const CPUState& guest, const std::array<CodeFingerpr
   return true;
 }
 // Fingerprint list sizes used by the other native modules.
+template bool NativeSdk::CodeMatches(const CPUState&, const std::array<CodeFingerprint, 1>&) const;
+template bool NativeSdk::CodeMatches(const CPUState&, const std::array<CodeFingerprint, 4>&) const;
 template bool NativeSdk::CodeMatches(const CPUState&, const std::array<CodeFingerprint, 7>&) const;
 template bool NativeSdk::CodeMatches(const CPUState&, const std::array<CodeFingerprint, 15>&) const;
 
@@ -431,38 +409,40 @@ bool NativeSdk::ThpVerifyPending(const CPUState& guest) const
 
 bool NativeSdk::GetHostPadData(int chan, u32 analog_mode, u32& hi, u32& lo)
 {
-  // The PC controller mapped to this GameCube port (InputCommon), packed as
-  // the controller's poll response so SPEC2_MakeStatus sees the same words.
-  if (m_system.GetSerialInterface().GetDeviceType(chan) != SerialInterface::SIDEVICE_GC_CONTROLLER)
+  // The PC controller on this GameCube port (HostGamePad, registered by the
+  // runtime), packed as the controller's poll response so SPEC2_MakeStatus
+  // sees the same words.
+  HostGamePad* host = GetHostGamePad();
+  if (!host)
     return false;
-  const GCPadStatus pad = Pad::GetStatus(chan);
-  if (!pad.isConnected)
+  const HostPadStatus pad = host->Poll(chan);
+  if (!pad.connected)
     return false;
-  hi = pad.stickY | (u32(pad.stickX) << 8) | (u32(u16(pad.button | kPadUseOrigin)) << 16);
+  hi = pad.stick_y | (u32(pad.stick_x) << 8) | (u32(u16(pad.buttons | kPadUseOrigin)) << 16);
   switch ((analog_mode >> 8) & 7)
   {
   case 1:
-    lo = (pad.analogB >> 4) | ((pad.analogA >> 4) << 4) | (u32(pad.triggerRight) << 8) |
-         (u32(pad.triggerLeft) << 16) | (u32(pad.substickY >> 4) << 24) |
-         (u32(pad.substickX >> 4) << 28);
+    lo = (pad.analog_b >> 4) | ((pad.analog_a >> 4) << 4) | (u32(pad.trigger_right) << 8) |
+         (u32(pad.trigger_left) << 16) | (u32(pad.substick_y >> 4) << 24) |
+         (u32(pad.substick_x >> 4) << 28);
     break;
   case 2:
-    lo = pad.analogB | (u32(pad.analogA) << 8) | (u32(pad.triggerRight >> 4) << 16) |
-         (u32(pad.triggerLeft >> 4) << 20) | (u32(pad.substickY >> 4) << 24) |
-         (u32(pad.substickX >> 4) << 28);
+    lo = pad.analog_b | (u32(pad.analog_a) << 8) | (u32(pad.trigger_right >> 4) << 16) |
+         (u32(pad.trigger_left >> 4) << 20) | (u32(pad.substick_y >> 4) << 24) |
+         (u32(pad.substick_x >> 4) << 28);
     break;
   case 3:
-    lo = pad.triggerRight | (u32(pad.triggerLeft) << 8) | (u32(pad.substickY) << 16) |
-         (u32(pad.substickX) << 24);
+    lo = pad.trigger_right | (u32(pad.trigger_left) << 8) | (u32(pad.substick_y) << 16) |
+         (u32(pad.substick_x) << 24);
     break;
   case 4:
-    lo = pad.analogB | (u32(pad.analogA) << 8) | (u32(pad.substickY) << 16) |
-         (u32(pad.substickX) << 24);
+    lo = pad.analog_b | (u32(pad.analog_a) << 8) | (u32(pad.substick_y) << 16) |
+         (u32(pad.substick_x) << 24);
     break;
   default:  // 0, 5, 6, 7
-    lo = (pad.analogB >> 4) | ((pad.analogA >> 4) << 4) | ((pad.triggerRight >> 4) << 8) |
-         ((pad.triggerLeft >> 4) << 12) | (u32(pad.substickY) << 16) |
-         (u32(pad.substickX) << 24);
+    lo = (pad.analog_b >> 4) | ((pad.analog_a >> 4) << 4) | ((pad.trigger_right >> 4) << 8) |
+         ((pad.trigger_left >> 4) << 12) | (u32(pad.substick_y) << 16) |
+         (u32(pad.substick_x) << 24);
     break;
   }
   return true;
@@ -572,7 +552,10 @@ bool NativeSdk::ComputePadRead(const CPUState& guest, bool from_si_latch, PadRes
     return false;
   std::memcpy(out.status.data(), status, 48);
   std::memcpy(out.previous.data(), previous, 48);
-  const u32 si_status = m_system.GetSerialInterface().PeekStatus();
+   // The SI latch exists only in the chassis (verification mode reads it).
+  if (from_si_latch && (!s_chassis.si_status || !s_chassis.si_input))
+    return false;
+  const u32 si_status = from_si_latch ? s_chassis.si_status() : 0;
 
   for (int chan = 0; chan < 4; ++chan)
   {
@@ -624,9 +607,7 @@ bool NativeSdk::ComputePadRead(const CPUState& guest, bool from_si_latch, PadRes
     }
     else if (sr & kSiNewData)
     {
-      auto& si = m_system.GetSerialInterface();
-      hi = si.PeekInHi(chan);
-      lo = si.PeekInLo(chan);
+      s_chassis.si_input(chan, hi, lo);
     }
     else
     {
@@ -702,7 +683,7 @@ bool NativeSdk::PadRead(CPUState& guest)
   Store32(barrel, result.barrel_bits);
   if (result.reset_idle)
     Store32(idle, 0);
-  const u64 now = m_system.GetSystemTimers().GetFakeTimeBase();
+  const u64 now = StaticRecompNativeClock::NativeClock::CurrentTimeBase();
   for (int chan = 0; chan < 4; ++chan)
   {
     if (result.type_read[chan])
@@ -965,19 +946,19 @@ bool NativeSdk::ReadDisc(u64 offset, u32 length, std::vector<u8>& out)
 bool NativeSdk::CopyToGuest(const CPUState& guest, u32 address, const u8* data, u32 length) const
 {
   // DMA-like copy: page by page through the DBATs (cached or uncached views).
-  constexpr u32 page_mask = PowerPC::BAT_PAGE_SIZE - 1;
-  constexpr u32 mapped = PowerPC::BAT_MAPPED_BIT | PowerPC::BAT_PHYSICAL_BIT;
+  constexpr u32 page_mask = StaticRecompNativeBat::kPageSize - 1;
+  constexpr u32 mapped = StaticRecompNativeBat::kMapped | StaticRecompNativeBat::kPhysical;
   if ((guest.msr & 0x10) == 0 || u64(address) + length > 0x100000000ull)
     return false;
   std::vector<std::pair<u8*, u32>> pieces;
   for (u32 done = 0; done < length;)
   {
     const u32 ea = address + done;
-    const u32 chunk = std::min(length - done, PowerPC::BAT_PAGE_SIZE - (ea & page_mask));
-    const u32 bat = m_system.GetMMU().GetDBATTable()[ea >> PowerPC::BAT_INDEX_SHIFT];
+    const u32 chunk = std::min(length - done, StaticRecompNativeBat::kPageSize - (ea & page_mask));
+    const u32 bat = StaticRecompCpuHost::g_cpu_host->Dbat(ea);
     if ((bat & mapped) != mapped)
       return false;
-    const u32 physical = (bat & PowerPC::BAT_RESULT_MASK) | (ea & page_mask);
+    const u32 physical = (bat & StaticRecompNativeBat::kResultMask) | (ea & page_mask);
     u8* host = nullptr;
     if (guest.ram && u64(physical) + chunk <= guest.ram_size)
       host = guest.ram + physical;
@@ -1108,7 +1089,7 @@ void NativeSdk::CheckDvdReads(const CPUState& guest)
     {
       const u32 ea = check.address + done;
       const u32 chunk = std::min<u32>(static_cast<u32>(check.data.size()) - done,
-                                      PowerPC::BAT_PAGE_SIZE - (ea & (PowerPC::BAT_PAGE_SIZE - 1)));
+                                      StaticRecompNativeBat::kPageSize - (ea & (StaticRecompNativeBat::kPageSize - 1)));
       const u8* p = Pointer(guest, ea, chunk);
       if (!p)
       {
@@ -1166,7 +1147,7 @@ bool NativeSdk::InstallNativeInterrupt(const CPUState& guest)
   const u8* vector = Pointer(guest, 0x80000500, 16);
   const u8* vi_entry = Pointer(guest, table + 4 * kViInterrupt, 4);
   const u8* ipc_entry = Pointer(guest, table + 4 * kIpcInterrupt, 4);
-  const auto sdk_code = [](u32 address) { return address >= 0x80200000 && address < 0x802A0000; };
+  const auto sdk_code = [](u32 address) { return address >= kSdkCodeBegin && address < kSdkCodeEnd; };
   const bool ready = entry && os_mask && user_mask && vector && vi_entry &&
                      Load32(vector) == 0x7C9043A6 && Load32(vector + 4) == 0x808000C0 &&
                      Load32(vector + 8) == 0x9064000C && Load32(vector + 12) == 0x7C7042A6 &&
@@ -1190,8 +1171,7 @@ bool NativeSdk::InstallNativeInterrupt(const CPUState& guest)
   }
   Store32(os_mask, Load32(os_mask) & ~kNativeInterruptBit);
   Store32(user_mask, Load32(user_mask) & ~kNativeInterruptBit);
-  auto& pi = m_system.GetProcessorInterface();
-  pi.m_interrupt_mask |= ProcessorInterface::INT_CAUSE_DEBUG;
+  StaticRecompNativePi::NativePi::EnableLines(StaticRecompNativePi::Line::kDebug);
   return true;
 }
 
@@ -1202,7 +1182,7 @@ bool NativeSdk::PostCallback(const CPUState& guest, const NativeCallback& call)
   m_callbacks.push_back(call);
   ++m_callbacks_posted;
   // Taken at the next interrupt check with MSR.EE set.
-  m_system.GetProcessorInterface().SetInterrupt(ProcessorInterface::INT_CAUSE_DEBUG, true);
+  StaticRecompNativePi::NativePi::Raise(StaticRecompNativePi::Line::kDebug, true);
   return true;
 }
 
@@ -1210,10 +1190,9 @@ bool NativeSdk::DeliverCallback(CPUState& guest)
 {
   // Entered as the OS interrupt handler: handler(interrupt, context), with
   // lr pointing back into the OS dispatcher.
-  auto& pi = m_system.GetProcessorInterface();
   if (m_callbacks.empty())
   {
-    pi.SetInterrupt(ProcessorInterface::INT_CAUSE_DEBUG, false);
+    StaticRecompNativePi::NativePi::Raise(StaticRecompNativePi::Line::kDebug, false);
     if (guest.gpr[3] != kNativeInterrupt)
     {
       // Not our interrupt: a real call of the debugger function.
@@ -1226,7 +1205,7 @@ bool NativeSdk::DeliverCallback(CPUState& guest)
   const NativeCallback call = m_callbacks.front();
   m_callbacks.erase(m_callbacks.begin());
   if (m_callbacks.empty())
-    pi.SetInterrupt(ProcessorInterface::INT_CAUSE_DEBUG, false);
+    StaticRecompNativePi::NativePi::Raise(StaticRecompNativePi::Line::kDebug, false);
   ++m_callbacks_delivered;
   if (call.kind == CallbackKind::ContextCall)
   {
@@ -1347,7 +1326,7 @@ bool NativeSdk::ReturnFromContextCall(CPUState& guest)
   return true;
 }
 
-void NativeSdk::DoState(PointerWrap& p, bool present, u32 version)
+void NativeSdk::DoState(StaticRecompState::StateStream& p, bool present, u32 version)
 {
   if (!present)
   {
@@ -1375,7 +1354,7 @@ void NativeSdk::DoState(PointerWrap& p, bool present, u32 version)
     p.SetMeasureMode();
     return;
   }
-  AudioDoState(p);
+  AudioDoState(p, version);
   if (version < 2)
     return;
   bool has_fs = m_fs != nullptr;
@@ -1387,7 +1366,7 @@ void NativeSdk::DoState(PointerWrap& p, bool present, u32 version)
     return;
   }
   if (has_fs)
-    FsDoState(p);
+    FsDoState(p, version);
 }
 
 bool NativeSdk::SkipBootNotice(CPUState& guest)
@@ -1401,6 +1380,16 @@ bool NativeSdk::SkipBootNotice(CPUState& guest)
   m_skip_notices=true;
   std::fprintf(stderr,"[native_sdk] boot notice omitted, return=0x%08X\n",guest.pc);
   return true;
+}
+
+bool NativeSdk::SkipBootNoticeEvent(CPUState& guest, u32 event)
+{
+  const u32 previous = guest.pc;
+  guest.pc = event == 0xffff0040u ? kStrapScreen : kNoticeScreen;
+  if (SkipBootNotice(guest))
+    return true;
+  guest.pc = previous;
+  return false;
 }
 
 bool NativeSdk::SkipNotice(CPUState& guest)
@@ -1426,6 +1415,7 @@ void NativeSdk::AuditCallbackGuest(const CPUState& guest)
 
 void NativeSdk::PrintStats() const
 {
+  PrintInlineStats();
   std::fprintf(stderr,"[native_sdk] callback guest lifetime: restores=%llu checks=%llu mismatches=%llu\n",
                static_cast<unsigned long long>(m_callback_guest_restores),
                static_cast<unsigned long long>(m_callback_guest_checks),
@@ -1458,6 +1448,7 @@ void NativeSdk::PrintStats() const
                  static_cast<unsigned long long>(m_dvd_cancelled));
   }
   PrintPadStats();
+  PrintWudStats();
   PrintThpStats();
   PrintAudioStats();
   PrintFsStats();

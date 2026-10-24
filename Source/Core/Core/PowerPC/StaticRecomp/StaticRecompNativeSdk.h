@@ -21,17 +21,26 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
-#include "Common/CommonTypes.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompTypes.h"
 #include "core/cpu.h"
 
-class PointerWrap;
+namespace StaticRecompState
+{
+class StateStream;
+}
 
 namespace Core
 {
 class System;
+}
+
+namespace StaticRecompNativeNand
+{
+class NandStore;
 }
 
 namespace StaticRecompNativeSdk
@@ -48,16 +57,55 @@ struct CodeFingerprint
 // Folder of the extracted game (sys/, files/); set by the runtime before boot.
 // Native disc reads come from these files.
 void SetGameRoot(const std::string& path);
+// Host folder of the Wii NAND (the user's Wii directory), for the native store.
+void SetNandRoot(const std::string& path);
+const std::string& GetNandRoot();
 const std::string& GameRoot();
 // Folder of user mods (music/ ...); empty: no mods. Served by native disc reads.
 void SetModsRoot(const std::string& path);
+// The running title's uid and group (phase G: set by the native boot as ES
+// does; the NAND layer uses them for the game's file operations).
+void SetTitleIdentity(u32 uid, u16 gid);
+bool GetTitleIdentity(u32* uid, u16* gid);
 
 class NativeSdk
 {
 public:
+  // Which chassis subsystems the native layer has replaced (set when the
+  // replacement binds). The native clock retires the chassis's periodic
+  // events of those subsystems: they only rescheduled themselves.
+  static bool AudioNative() { return s_audio_native; }
+  static bool IpcNative() { return s_ipc_native; }
+  static inline bool s_audio_native = false;
+  static inline bool s_ipc_native = false;
+
   // Legacy AOT modules can expose boot calls through the host callback.
   bool SkipBootNotice(CPUState& guest);
-  explicit NativeSdk(Core::System& system);
+  // A menu extension module's boot-notice event (0xffff0040 strap,
+  // 0xffff0041 controllers): SkipBootNotice at that screen's entry.
+  bool SkipBootNoticeEvent(CPUState& guest, u32 event);
+  // What the SDK layer needs from the chassis while it exists (installed by
+  // StaticRecompNativeSdkChassis): the SI latch for the PADRead verification
+  // mode, its DSP/audio DMA parked once native audio runs, the AI and DSP
+  // register values a `.sav` of the chassis carries (false when the native
+  // host loop left the device uninitialised: the power-on values are used),
+  // the title identity from its IOS kernel (chassis boot only) and the
+  // migration of file handles from states written before the own NAND store.
+  struct ChassisHooks
+  {
+    std::function<u32()> si_status;
+    std::function<void(int chan, u32& hi, u32& lo)> si_input;
+    std::function<void()> park_audio;
+    std::function<bool(u32& control, u32& volume, u32& interrupt_timing)> ai_seed;
+    std::function<bool(u16& control)> dsp_control_seed;
+    std::function<bool(u32* uid, u16* gid)> ios_title_identity;
+    // Offset of a chassis FS handle (closed afterwards); nullopt = unknown.
+    std::function<std::optional<u32>(u32 fs_fd)> migrate_fs_handle;
+  };
+  static void SetChassisHooks(ChassisHooks hooks);
+  static inline ChassisHooks s_chassis;
+
+  NativeSdk();
   ~NativeSdk();
 
   // `addresses`/`flags`/`any` come from the module's staticrecomp_native_hooks
@@ -93,7 +141,7 @@ public:
 
   // Savestate section: pending native interrupts and the native audio state.
   // `present` is false when loading a state saved without it.
-  void DoState(PointerWrap& p, bool present, u32 version);
+  void DoState(StaticRecompState::StateStream& p, bool present, u32 version);
 
   // Native audio DMA: block boundary (CoreTiming event).
   void AudioDmaEvent(s64 cycles_late);
@@ -106,6 +154,17 @@ public:
     ++m_callback_guest_restores;
   }
   void AuditCallbackGuest(const CPUState& guest);
+
+  // Inline native replacements (StaticRecompNativeInline.cpp): fills the
+  // module's table (staticrecomp_native_inline) for the functions this layer
+  // runs in place of a direct call. Call after Bind.
+  using InlineFunction = int (*)(CPUState*);
+  void BindInline(u32 count, InlineFunction* table);
+  // Verify mode: runs the guest function at `address` on a copy of `guest`
+  // (same stack) and returns the state at its return.
+  using InlineVerifier = std::function<std::optional<CPUState>(CPUState& guest, u32 address)>;
+  static void SetInlineVerifier(InlineVerifier verifier);
+  bool RunSqrt(CPUState& cpu);
 
 private:
   struct PadResult
@@ -184,6 +243,25 @@ private:
   // PADRead and PADControlMotor on the SDK's own variables and the PC
   // controller, without the serial interface.
   struct PadState;
+
+public:
+  // The PAD library runs natively (no serial interface): the native VI may skip the SI poll.
+  bool PadNative() const { return m_pad != nullptr; }
+  // The SI register page (0xCD006400..FF) as the SDK's SIInit sees it: plain
+  // storage that always reads idle (phase D closure; no emulated transfers).
+  bool SiRegisterRead(u32 ea, u8 size, u64* value);
+  bool SiRegisterWrite(u32 ea, u8 size, u64 value);
+  // Audio interface registers (0xCD006C00: control, volume, sample counter,
+  // interrupt timing). The SDK's AI functions are native; what remains are
+  // the direct reads of AICR (AIGetStreamPlayState) and the few writes.
+  bool AiRegisterRead(u32 ea, u8 size, u64* value);
+  bool AiRegisterWrite(u32 ea, u8 size, u64 value);
+  // The DSP control register (0xCC00500A, 16-bit): __OSInterruptInit reads it
+  // and writes the interrupt masks at boot; the SDK's DSP functions are native.
+  bool DspControlRead(u32 ea, u8 size, u64* value);
+  bool DspControlWrite(u32 ea, u8 size, u64 value);
+
+private:
   bool PadBind(const std::function<bool(u32)>& enable, bool wanted);
   bool PadRun(CPUState& guest);
   bool PadReady(const CPUState& guest);
@@ -194,8 +272,18 @@ private:
   bool PadVar(const CPUState& guest, u32 address, u32& value) const;
   void PadSetVar(const CPUState& guest, u32 address, u32 value) const;
   bool HostPadConnected(int chan);
+  bool SiInitGetType(CPUState& guest);
   void PrintPadStats() const;
   std::unique_ptr<PadState> m_pad;
+
+  // Native WUD library (StaticRecompNativeWud.cpp): WUDInit completes at once
+  // as "adapter ready, no Wii Remote" and the bte entry points wud.a reaches
+  // become no-ops, so the Bluetooth stack and the IOS USB device never run.
+  struct WudState;
+  bool WudBind(const std::function<bool(u32)>& enable, bool wanted);
+  bool WudRun(CPUState& guest);
+  void PrintWudStats() const;
+  std::unique_ptr<WudState> m_wud;
 
   bool DvdReadAbs(CPUState& guest);
   // Reads `length` bytes at partition offset `offset` from the extracted files.
@@ -286,7 +374,8 @@ private:
   struct FsState;
   bool FsBind(const std::function<bool(u32)>& enable, bool wanted);
   bool FsRun(CPUState& guest);
-  void FsDoState(PointerWrap& p);
+  void FsDoState(StaticRecompState::StateStream& p, u32 version);
+  std::unique_ptr<StaticRecompNativeNand::NandStore> m_nand;  // phase C3: own NAND store
   void PrintFsStats() const;
   std::unique_ptr<FsState> m_fs;
 
@@ -304,7 +393,7 @@ private:
   void AudioFinishVerify();
   void AudioStartDma();
   void AudioConfigureHost();
-  void AudioDoState(PointerWrap& p);
+  void AudioDoState(StaticRecompState::StateStream& p, u32 version);
   void PrintAudioStats() const;
   std::unique_ptr<AudioState> m_audio;
   u32 m_audio_verify_lr = 0, m_audio_verify_sp = 0;
@@ -336,9 +425,14 @@ private:
   std::vector<TraceCall> m_trace_calls;
   FILE* m_trace_file = nullptr;
 
-  Core::System& m_system;
   bool m_verify = false;
   bool m_pad_read = false;
+  bool m_si_set_xy = false;
+  bool m_si_get_type = false;         // SIGetType from SIInit completed natively
+  bool m_si_code_checked = false;
+  std::array<u32, 64> m_si_regs{};    // 0xCD006400..0xCD0064FF as the SDK leaves them
+  u64 m_si_register_accesses = 0;
+  u64 m_si_init_probes = 0;
   bool m_kpad_read = false;
   bool m_dvd_read = false;
   bool m_dvd_status_hook = false;  // verify mode: DVDGetCommandBlockStatus exits too
@@ -347,6 +441,16 @@ private:
   u64 m_dvd_bytes = 0;
   u32 m_fst_address = 0;  // guest FST the file table was built from
   u32 m_min = 1, m_max = 0;
+  const u32* m_hook_addresses = nullptr;  // the module's hook list (sorted)
+  u32 m_hook_count = 0;
+  struct InlineStats
+  {
+    bool checked = false, enabled = false;
+    u64 calls = 0, fallbacks = 0, budget = 0, verified = 0, mismatches = 0;
+  };
+  InlineStats m_inline_sqrt;
+  bool m_inline_verify = false;
+  void PrintInlineStats() const;
   Pending m_pending;
   Stats m_pad_stats;
   Stats m_kpad_stats;

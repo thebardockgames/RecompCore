@@ -242,6 +242,8 @@ static void CopyDefaultExceptionHandlers(Core::System& system)
 }
 
 // Third boot step after BootManager and Core. See Call schedule in BootManager.cpp
+CBoot::NativeBoot CBoot::s_native_boot;
+
 bool CBoot::BootUp(Core::System& system, const Core::CPUThreadGuard& guard,
                    std::unique_ptr<BootParameters> boot)
 {
@@ -256,6 +258,16 @@ bool CBoot::BootUp(Core::System& system, const Core::CPUThreadGuard& guard,
   // PAL Wii uses NTSC framerate and linecount in 60Hz modes
   system.GetVideoInterface().Preset(DiscIO::IsNTSC(config.m_region) ||
                                     (system.IsWii() && Config::Get(Config::SYSCONF_PAL60)));
+
+  // RecompCore: the native boot sets memory and registers itself. The disc
+  // still goes into the chassis's drive (state only: the game reads natively),
+  // so savestates taken with a disc inserted keep loading.
+  if (s_native_boot)
+  {
+    if (auto* disc = std::get_if<BootParameters::Disc>(&boot->parameters))
+      SetDisc(system.GetDVDInterface(), std::move(disc->volume), disc->auto_disc_change_paths);
+    return s_native_boot(system, guard);
+  }
 
   struct BootTitle
   {

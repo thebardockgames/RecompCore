@@ -38,6 +38,7 @@
 #include "Core/HW/WII_IPC.h"
 #include "Core/PowerPC/JitCommon/JitBase.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompGuestRam.h"
 #include "Core/System.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/PixelEngine.h"
@@ -135,7 +136,13 @@ void MemoryManager::Init()
     region.active = true;
     mem_size += region.size;
   }
-  m_arena.GrabSHMSegment(mem_size, "dolphin-emu");
+
+  // RecompCore: buffers lent by the runtime cover every active region?
+  m_using_external = m_external.ram && !fake_vmem && m_external.ram_size >= GetRamSize() &&
+                     m_external.l1 && m_external.l1_size >= GetL1CacheSize() &&
+                     (!wii || (m_external.exram && m_external.exram_size >= GetExRamSize()));
+  if (!m_using_external)
+    m_arena.GrabSHMSegment(mem_size, "dolphin-emu");
 
   m_physical_page_mappings.fill(nullptr);
 
@@ -145,7 +152,17 @@ void MemoryManager::Init()
     if (!region.active)
       continue;
 
-    *region.out_pointer = (u8*)m_arena.CreateView(region.shm_position, region.size);
+    if (m_using_external)
+    {
+      *region.out_pointer = region.out_pointer == &m_ram      ? m_external.ram :
+                            region.out_pointer == &m_l1_cache ? m_external.l1 :
+                            region.out_pointer == &m_exram    ? m_external.exram :
+                                                                nullptr;
+    }
+    else
+    {
+      *region.out_pointer = (u8*)m_arena.CreateView(region.shm_position, region.size);
+    }
 
     if (!*region.out_pointer)
     {
@@ -167,7 +184,16 @@ void MemoryManager::Init()
 
   Clear();
 
-  INFO_LOG_FMT(MEMMAP, "Memory system initialized. RAM at {}", fmt::ptr(m_ram));
+  INFO_LOG_FMT(MEMMAP, "Memory system initialized. RAM at {}{}", fmt::ptr(m_ram),
+               m_using_external ? " (lent by the runtime)" : "");
+  // RecompCore: without lent memory, the port's view adopts these buffers so
+  // the native modules (built before the CPU core runs) see valid pointers.
+  if (!m_using_external)
+  {
+    StaticRecompGuestRam::GuestRam::Instance().Adopt(m_ram, m_ram_size_real, m_exram,
+                                                     m_exram_size_real, m_l1_cache,
+                                                     m_l1_cache_size);
+  }
   m_is_initialized = true;
 }
 
@@ -178,6 +204,8 @@ bool MemoryManager::IsAddressInFastmemArea(const u8* address) const
 
 bool MemoryManager::InitFastmemArena()
 {
+  if (m_using_external)
+    return false;  // RecompCore: lent buffers, no arena to map twice
   if (m_is_fastmem_arena_initialized)
     return true;
 
@@ -554,10 +582,18 @@ void MemoryManager::Shutdown()
     if (!region.active)
       continue;
 
-    m_arena.ReleaseView(*region.out_pointer, region.size);
+    if (!m_using_external)
+      m_arena.ReleaseView(*region.out_pointer, region.size);
     *region.out_pointer = nullptr;
   }
-  m_arena.ReleaseSHMSegment();
+  if (!m_using_external)
+  {
+    m_arena.ReleaseSHMSegment();
+    auto& guest_ram = StaticRecompGuestRam::GuestRam::Instance();
+    if (!guest_ram.Owned())
+      guest_ram.Release();  // it pointed at the views released above
+  }
+  m_using_external = false;
   m_mmio_mapping.reset();
   INFO_LOG_FMT(MEMMAP, "Memory system shut down.");
 }

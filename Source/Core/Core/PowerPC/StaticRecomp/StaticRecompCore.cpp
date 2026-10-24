@@ -9,14 +9,27 @@
 
 #include "Common/ChunkFile.h"
 #include "Common/Config/Config.h"
-#include "Common/DynamicLibrary.h"
+#include "Common/CommonPaths.h"
 #include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/StaticRecompSettings.h"
 #include "Core/Config/ConfigManager.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompModuleLoader.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeSdk.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeGp.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeVi.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeExi.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativePi.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeAx.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeClockChassis.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeGpChassis.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativePiChassis.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeSdkChassis.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeViChassis.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeClock.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompStateStream.h"
 #include "Core/System.h"
 
 #ifdef _M_X86_64
@@ -31,49 +44,6 @@ StaticRecompCore* g_static_recomp_core = nullptr;
 
 namespace
 {
-bool RangesAreSorted(const StaticRecompRange* ranges, u32 count)
-{
-  if (!ranges || count == 0)
-    return false;
-  for (u32 i = 0; i < count; ++i)
-  {
-    if (ranges[i].start >= ranges[i].end ||
-        (i != 0 && ranges[i - 1].end > ranges[i].start))
-      return false;
-  }
-  return true;
-}
-
-bool AddressIsCovered(const StaticRecompRange* ranges, u32 count, u32 address)
-{
-  for (u32 i = 0; i < count; ++i)
-  {
-    if (address >= ranges[i].start && address < ranges[i].end)
-      return true;
-  }
-  return false;
-}
-
-bool ChunksTileCode(const StaticRecompModuleDesc& desc)
-{
-  if (!RangesAreSorted(desc.chunk_ranges, desc.num_chunk_ranges) || !desc.chunk_hashes)
-    return false;
-  u32 chunk = 0;
-  for (u32 code = 0; code < desc.num_code_ranges; ++code)
-  {
-    u32 cursor = desc.code_ranges[code].start;
-    while (chunk < desc.num_chunk_ranges && desc.chunk_ranges[chunk].start < desc.code_ranges[code].end)
-    {
-      if (desc.chunk_ranges[chunk].start != cursor ||
-          desc.chunk_ranges[chunk].end > desc.code_ranges[code].end)
-        return false;
-      cursor = desc.chunk_ranges[chunk++].end;
-    }
-    if (cursor != desc.code_ranges[code].end)
-      return false;
-  }
-  return chunk == desc.num_chunk_ranges;
-}
 }  // namespace
 
 bool StaticRecompCore::IsModuleActive() const
@@ -91,6 +61,7 @@ StaticRecompCore::~StaticRecompCore() = default;
 void StaticRecompCore::Init()
 {
   g_static_recomp_core = this;
+  StaticRecompCpuHost::g_cpu_host = this;
   RefreshConfig();
   jo.enableBlocklink = false;
   jo.fastmem = false;
@@ -157,9 +128,25 @@ void StaticRecompCore::Shutdown()
     }
   }
   g_static_recomp_core = nullptr;
-  if (m_native_sdk)
-    m_native_sdk->PrintStats();
-  m_native_sdk.reset();
+  StaticRecompCpuHost::g_cpu_host = nullptr;
+  if (m_machine.sdk)
+    m_machine.sdk->PrintStats();
+  if (m_machine.gp)
+    m_machine.gp->PrintStats();
+  if (m_machine.vi)
+    m_machine.vi->PrintStats();
+  if (m_machine.pi)
+    m_machine.pi->PrintStats();
+  if (m_machine.exi)
+    m_machine.exi->PrintStats();
+  if (m_machine.clock)
+    m_machine.clock->PrintStats();
+  m_machine.vi.reset();
+  m_machine.gp.reset();
+  m_machine.sdk.reset();
+  m_machine.exi.reset();
+  m_machine.pi.reset();
+  m_machine.clock.reset();
   std::fprintf(stderr,
                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
                "smc_failed=%u verifications=%llu reverify_events=%llu jit_fallback_runs=%llu "
@@ -168,11 +155,11 @@ void StaticRecompCore::Shutdown()
                "native_gather_register_instructions=%llu native_scratch_register_instructions=%llu "
                "native_decrementer_reads=%llu native_decrementer_writes=%llu "
                "native_dma_register_instructions=%llu native_system_register_instructions=%llu "
-               "branch_batching_enabled=%d\n",
+               "branch_batching_enabled=%d bursts=%llu sync_in=%llu sync_out=%llu sync_exceptions_native=%llu physical_accesses=%llu\n",
                (unsigned long long)m_native_dispatches, (unsigned long long)m_fallback_steps,
                (unsigned long long)m_native_exceptions,
-               (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
-               (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
+               (unsigned long long)m_hook_fallback_instructions, m_code_guard.Failed(),
+               (unsigned long long)m_code_guard.Verifications(), (unsigned long long)m_code_guard.ReverifyEvents(),
                (unsigned long long)m_fallback_jit_runs,
                (unsigned long long)m_native_kernel_calls,
                (unsigned long long)m_native_cache_instructions,
@@ -185,14 +172,17 @@ void StaticRecompCore::Shutdown()
                (unsigned long long)m_native_decrementer_writes,
                (unsigned long long)m_native_dma_register_instructions,
                (unsigned long long)m_native_system_register_instructions,
-               m_native_branch_batching && m_module && m_module->cpu_abi_version >= 3 ? 1 : 0);
+               m_native_branch_batching && m_module && m_module->cpu_abi_version >= 3 ? 1 : 0,
+               (unsigned long long)m_bursts, (unsigned long long)m_sync_in,
+               (unsigned long long)m_sync_out,
+               (unsigned long long)m_native_sync_exceptions_delivered, (unsigned long long)m_native_physical_accesses);
   NOTICE_LOG_FMT(POWERPC,
                  "StaticRecomp: shutdown. native_dispatches={} fallback_steps={} "
                  "native_exceptions={} hook_fallback_instructions={} smc_failed_chunks={} "
                  "verifications={} reverify_events={}",
                  m_native_dispatches, m_fallback_steps, m_native_exceptions,
-                 m_hook_fallback_instructions, m_failed_chunks, m_verifications,
-                 m_reverify_events);
+                 m_hook_fallback_instructions, m_code_guard.Failed(), m_code_guard.Verifications(),
+                 m_code_guard.ReverifyEvents());
   m_lockstep_verifier.reset();
   m_block_cache.Shutdown();
   m_module = nullptr;
@@ -223,13 +213,13 @@ void StaticRecompCore::LoadModule()
   }
   else
   {
-    if (path.empty() || !File::Exists(path) || !m_library.Open(path.c_str()))
+    if (path.empty() || !m_library.Open(path))
     {
       ERROR_LOG_FMT(POWERPC, "StaticRecomp: failed to open explicit module '{}'.", path);
       return;
     }
     const auto get_module = reinterpret_cast<StaticRecompGetModuleFn>(
-        m_library.GetSymbolAddress(STATICRECOMP_GET_MODULE_SYMBOL));
+        m_library.Symbol(STATICRECOMP_GET_MODULE_SYMBOL));
     desc = get_module ? get_module() : nullptr;
   }
 
@@ -242,58 +232,40 @@ void StaticRecompCore::LoadModule()
 
   if (!desc)
     return reject("missing or null " STATICRECOMP_GET_MODULE_SYMBOL);
-  if (desc->abi_version != STATICRECOMP_ABI_VERSION)
-    return reject(fmt::format("abi_version {} != {}", desc->abi_version, STATICRECOMP_ABI_VERSION));
-  // CPU ABIs only append fields: older modules see an exact prefix (v2 ends
-  // before dispatch_budget, v3 before chunk_state).
-  size_t expected_state_size = sizeof(CPUState);
-  if (desc->cpu_abi_version == 2u)
-    expected_state_size = offsetof(CPUState, dispatch_budget);
-  else if (desc->cpu_abi_version == 3u)
-    expected_state_size = offsetof(CPUState, chunk_state);
-  else if (desc->cpu_abi_version != GXRUNTIME_CPU_ABI_VERSION)
-    return reject(fmt::format("cpu_abi_version {} != {}", desc->cpu_abi_version,
-                              GXRUNTIME_CPU_ABI_VERSION));
-  if (desc->cpu_state_size != expected_state_size)
-    return reject(fmt::format("cpu_state_size {} != expected {} for CPU ABI {}",
-                              desc->cpu_state_size, expected_state_size, desc->cpu_abi_version));
-  if (!desc->dispatch || !desc->code_ranges || desc->num_code_ranges == 0)
-    return reject("no dispatch entry or empty code ranges");
-  if (!std::memchr(desc->game_id, '\0', sizeof(desc->game_id)) || desc->game_id[0] == '\0')
-    return reject("invalid game_id");
-  if (!RangesAreSorted(desc->code_ranges, desc->num_code_ranges))
-    return reject("malformed or overlapping code ranges");
-  if (desc->num_smc_ranges != 0 && !RangesAreSorted(desc->smc_ranges, desc->num_smc_ranges))
-    return reject("malformed or overlapping SMC ranges");
-  if (!desc->chunk_ranges || desc->num_chunk_ranges == 0 || !desc->chunk_hashes)
-    return reject("no chunk ranges/hashes (required for the SMC guard)");
-  if (!ChunksTileCode(*desc))
-    return reject("chunk ranges do not exactly tile code ranges");
-  if (!AddressIsCovered(desc->code_ranges, desc->num_code_ranges, desc->entry_point))
-    return reject("entry point is not covered by the module");
-  if (!game_id.empty() && game_id != desc->game_id)
-    return reject(fmt::format("module game_id '{}' != running game '{}'", desc->game_id, game_id));
+  if (const std::optional<std::string> error = StaticRecompModuleLoader::ValidateModule(*desc, game_id))
+    return reject(*error);
 
   m_module = desc;
   m_module_active = (desc != nullptr);
-  m_chunk_state.assign(desc->num_chunk_ranges, CHUNK_UNVERIFIED);
-  m_failed_chunks = 0;
-  m_lookup_ram_size = 0;
-  m_lookup_exram_size = 0;
-  m_chunk_lookup_table.clear();
+  m_code_guard.Bind(desc);
 
   std::fprintf(stderr, "[staticrecomp] module loaded: %s entry=0x%08X\n", path.c_str(),
                desc->entry_point);
-  m_native_sdk.reset();
+  m_machine.vi.reset();
+  m_machine.gp.reset();
+  m_machine.sdk.reset();
   using NativeHooksFn = u32 (*)(const u32**, unsigned char**, int**);
   using MenuVersionFn=u32 (*)();
-  const auto menu_version=m_library.IsOpen()?reinterpret_cast<MenuVersionFn>(m_library.GetSymbolAddress("staticrecomp_menu_extension_version")):nullptr;
+  const auto menu_version=m_library.IsOpen()?reinterpret_cast<MenuVersionFn>(m_library.Symbol("staticrecomp_menu_extension_version")):nullptr;
   m_menu_extension_version=menu_version?menu_version():0;
   m_guest.host_call=m_menu_extension_version>=1&&m_menu_extension_version<=3?HookMenuExtension:nullptr;
   if(m_guest.host_call)std::fprintf(stderr,"[pc_menu] original-controller extension module v%u\n",m_menu_extension_version);
   const auto native_hooks = m_library.IsOpen() ?
-      reinterpret_cast<NativeHooksFn>(m_library.GetSymbolAddress("staticrecomp_native_hooks")) :
+      reinterpret_cast<NativeHooksFn>(m_library.Symbol("staticrecomp_native_hooks")) :
       nullptr;
+  // Phase F: the event clock and the interrupt controller come first (the SDK
+  // layer registers its audio DMA event at bind time); the other native modules schedule on the clock and raise lines on the PI.
+  StaticRecompNativeAudio::NativeAxWii::SetCoefficientPaths(
+      {File::GetUserPath(D_GCUSER_IDX) + "dsp_coef.bin", File::GetSysDirectory() + "/GC/dsp_coef.bin"});
+  StaticRecompNativeClockChassis::Install(m_system);
+  m_machine.clock = std::make_unique<StaticRecompNativeClock::NativeClock>();
+  StaticRecompNativePiChassis::Install(m_system);
+  m_machine.pi = std::make_unique<StaticRecompNativePi::NativePi>();
+  m_machine.exi = std::make_unique<StaticRecompNativeExi::NativeExi>(
+      SConfig::GetInstance().GetGameID(),
+      reinterpret_cast<const u8*>(&m_system.GetSRAM()), 0x44,
+      StaticRecompNativeExi::NativeExi::Paths{File::GetUserPath(D_WIIROOT_IDX) + "sram.bin",
+                                               File::GetSysDirectory() + GC_SYS_DIR + DIR_SEP});
   if (native_hooks)
   {
     const u32* addresses = nullptr;
@@ -303,9 +275,19 @@ void StaticRecompCore::LoadModule()
     std::fprintf(stderr, "[staticrecomp] module native hooks: %u\n", count);
     if (count && addresses && flags && any)
     {
-      m_native_sdk = std::make_unique<StaticRecompNativeSdk::NativeSdk>(m_system);
-      m_native_sdk->Bind(count, addresses, flags, any);
+      StaticRecompNativeSdkChassis::Install(m_system);
+      m_machine.sdk = std::make_unique<StaticRecompNativeSdk::NativeSdk>();
+      m_machine.sdk->Bind(count, addresses, flags, any);
     }
+  }
+  // Phase E: the GX stream front (active only with the NativeGX renderer).
+  StaticRecompNativeGpChassis::Install(m_system);
+  m_machine.gp = std::make_unique<StaticRecompNativeGp::NativeGp>();
+  // Phase D: the video interface, once the native PAD library replaces the SI poll.
+  if (m_machine.sdk && m_machine.sdk->PadNative())
+  {
+    StaticRecompNativeViChassis::Install(m_system);
+    m_machine.vi = std::make_unique<StaticRecompNativeVi::NativeVi>();
   }
   NOTICE_LOG_FMT(POWERPC,
                  "StaticRecomp: loaded module '{}' (game_id={} entry=0x{:08X} "
@@ -314,22 +296,91 @@ void StaticRecompCore::LoadModule()
                  desc->num_smc_ranges);
 }
 
+namespace
+{
+// The chassis's PointerWrap behind our serializer interface: same bytes, the
+// chassis's buffer and its measure/bounds handling.
+class PointerWrapStream final : public StaticRecompState::StateStream
+{
+public:
+  // The chassis's Measure pass is a write that only advances the pointer: the
+  // modules take their write path and every byte still goes through the
+  // PointerWrap, so the measured size equals the written one. Our Measure mode
+  // is only the bail-out, which also stops the chassis.
+  explicit PointerWrapStream(PointerWrap& p)
+      : StateStream(p.IsReadMode() ? Mode::Read : Mode::Write), m_p(p)
+  {
+  }
+  void Bytes(void* data, size_t size) override
+  {
+    if (IsMeasureMode())
+      return;
+    m_p.DoArray(static_cast<u8*>(data), static_cast<u32>(size));
+    if (m_p.IsReadMode() == false && m_p.IsWriteMode() == false && !m_was_measure)
+      StateStream::SetMeasureMode();  // the chassis ran out of buffer while writing/reading
+  }
+  void SetMeasureMode() override
+  {
+    StateStream::SetMeasureMode();
+    if (!m_was_measure)
+      m_p.SetMeasureMode();
+  }
+
+private:
+  PointerWrap& m_p;
+  const bool m_was_measure = m_p.IsMeasureMode();
+};
+}  // namespace
+
 void StaticRecompCore::DoExtraState(PointerWrap& p, bool present)
 {
-  // Version 1: the native SDK layer (pending native interrupts, native audio).
-  // Version 2: + deferred callbacks and native NAND handles.
-  u32 version = m_native_sdk ? 2 : 0;
-  if (present)
-    p.Do(version);
-  if (m_native_sdk)
-  {
-    m_native_sdk->DoState(p, present && version >= 1, version);
-  }
-  else if (p.IsReadMode() && present && version != 0)
-  {
-    std::fprintf(stderr, "[staticrecomp] state has native SDK data but no native module is loaded\n");
-    p.SetMeasureMode();
-  }
+  PointerWrapStream stream(p);
+  DoNativeState(stream, present);
+}
+
+void StaticRecompCore::DoNativeState(StaticRecompState::StateStream& p, bool present)
+{
+  m_machine.DoState(p, present);
+  if (p.IsReadMode())
+    UpdateNativeBats();
+}
+
+u32* StaticRecompCore::Sprs()
+{
+  return m_authority == StateAuthority::Guest ? m_regs.spr : m_system.GetPPCState().spr;
+}
+
+int& StaticRecompCore::Downcount()
+{
+  return m_authority == StateAuthority::Guest ? m_regs.downcount : m_system.GetPPCState().downcount;
+}
+
+u32& StaticRecompCore::PendingExceptions()
+{
+  return m_authority == StateAuthority::Guest ? m_regs.exceptions :
+                                               m_system.GetPPCState().Exceptions;
+}
+
+void StaticRecompCore::FoldChassisExceptions()
+{
+  if (m_authority != StateAuthority::Guest)
+    return;
+  auto& ppc = m_system.GetPPCState();
+  m_regs.exceptions |= ppc.Exceptions;
+  ppc.Exceptions = 0;
+}
+
+void StaticRecompCore::UpdateNativeBats()
+{
+  const u32* spr = Sprs();
+  auto& memory = m_system.GetMemory();
+  m_native_dbat.Update(spr, ((spr[SPR_HID4] >> 25) & 1) != 0, memory.GetRamSizeReal(),
+                       memory.GetExRamSizeReal(), memory.GetL1CacheSize());
+}
+
+void StaticRecompCore::SeedNativeDevicesForNativeState()
+{
+  m_machine.SeedForCheckpoint();
 }
 
 void StaticRecompCore::ClearCache()
@@ -339,7 +390,5 @@ void StaticRecompCore::ClearCache()
 
   if (!m_module)
     return;
-  std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
-  m_failed_chunks = 0;
-  ++m_reverify_events;
+  m_code_guard.ResetAll();
 }

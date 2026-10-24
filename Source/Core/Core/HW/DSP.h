@@ -106,6 +106,7 @@ public:
   // devices stay idle (no DSP emulation slices, no samples pushed).
   void SetNativeAudio(bool native) { m_native_audio = native; }
   bool IsNativeAudio() const { return m_native_audio; }
+  u16 GetControlRegister() const { return m_dsp_control.Hex; }  // RecompCore: seed of the native DSP CSR
 
 private:
   void GenerateDSPInterrupt(u64 DSPIntType, s64 cyclesLate);

@@ -275,6 +275,15 @@ void Stop(Core::System& system)  // - Hammertime!
 
 
 // For the CPU Thread only.
+void NativeSetCoreState(State state)
+{
+  {
+    std::lock_guard core_lock(s_core_mutex);
+    s_state.store(state);
+  }
+  NotifyStateChanged(state);
+}
+
 static void CPUSetInitialExecutionState(Core::System& system, bool force_paused = false)
 {
   // The CPU starts in stepping state, and will wait until a new state is set before executing.

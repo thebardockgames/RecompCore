@@ -141,10 +141,12 @@ static DOLRECOMP_TYPES_FORCEINLINE u64 convert_to_double(u32 value) {
         u64 z = (y << 61) | (y << 60) | (y << 59);
         return ((x & 0xC0000000u) << 32) | z | ((x & 0x3FFFFFFFu) << 29);
     }
+    if ((x & 0x7FFFFFFFu) == 0) /* +-0: what convert_to_double_special gives, inline (matrices are full of zeros) */
+        return (x & 0x80000000u) << 32;
     return convert_to_double_special(value);
 }
 
-static inline u32 convert_to_single(u64 x) {
+static DOLRECOMP_TYPES_FORCEINLINE u32 convert_to_single(u64 x) {
     u32 exp = (u32)((x >> 52) & 0x7FFu);
     if (exp > 896 || (x & ~0x8000000000000000ull) == 0) {
         return (u32)(((x >> 32) & 0xC0000000u) | ((x >> 29) & 0x3FFFFFFFu));
@@ -159,7 +161,7 @@ static inline u32 convert_to_single(u64 x) {
     }
 }
 
-static inline u32 convert_to_single_ftz(u64 x) {
+static DOLRECOMP_TYPES_FORCEINLINE u32 convert_to_single_ftz(u64 x) {
     u32 exp = (u32)((x >> 52) & 0x7FFu);
     if (exp > 896 || (x & ~0x8000000000000000ull) == 0)
         return (u32)(((x >> 32) & 0xC0000000u) | ((x >> 29) & 0x3FFFFFFFu));

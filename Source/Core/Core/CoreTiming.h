@@ -16,6 +16,7 @@
 // inside callback:
 //   ScheduleEvent(periodInCycles - cyclesLate, callback, "whatever")
 
+#include <functional>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -34,6 +35,11 @@ class PointerWrap;
 namespace Core
 {
 class System;
+}
+namespace StaticRecompNativeClock
+{
+class NativeClock;
+struct ChassisSnapshot;
 }
 
 namespace CoreTiming
@@ -103,6 +109,24 @@ public:
   u64 GetTicks() const;
   u64 GetIdleTicks() const;
   TimePoint GetTargetHostTime(s64 target_cycle);
+  // RecompCore: the native clock owns the real-time limiter while it exists.
+  void SetNativeTargetHostTime(std::function<TimePoint(s64)> hook)
+  {
+    m_native_target_host_time = std::move(hook);
+  }
+  // RecompCore, phase S: with a native clock attached this manager is a facade.
+  // The counter, the slice loop, the queue and the delivery of external
+  // interrupts live in the native clock; the chassis's devices keep scheduling
+  // through these methods and their callbacks run from the native queue.
+  void SetNativeClock(StaticRecompNativeClock::NativeClock* clock) { m_native_clock = clock; }
+  StaticRecompNativeClock::NativeClock* GetNativeClock() const { return m_native_clock; }
+  // Hands the counter and the queued events to the native clock (its queue
+  // is then empty) and takes them back when the native clock goes away.
+  StaticRecompNativeClock::ChassisSnapshot DetachForNativeClock();
+  void AttachFromNativeClock(const StaticRecompNativeClock::ChassisSnapshot& snapshot);
+  // Loading a native checkpoint: the counter continues from `ticks`, the slice
+  // restarts and every pending event is dropped.
+  void ResetCounterForLoad(s64 ticks);
 
   void RefreshConfig();
 
@@ -213,6 +237,8 @@ private:
 
   s64 m_throttle_reference_cycle = 0;
   TimePoint m_throttle_reference_time = Clock::now();
+  std::function<TimePoint(s64)> m_native_target_host_time;
+  StaticRecompNativeClock::NativeClock* m_native_clock = nullptr;
   u32 m_throttle_adj_clock_per_sec = 0;
   bool m_throttle_disable_vi_int = false;
 

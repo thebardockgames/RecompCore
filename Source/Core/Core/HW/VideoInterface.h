@@ -20,6 +20,11 @@ namespace MMIO
 class Mapping;
 }
 
+namespace StaticRecompNativeViChassis
+{
+struct Access;
+}
+
 namespace VideoInterface
 {
 // VI Internal Hardware Addresses
@@ -352,6 +357,8 @@ union UVIHorizontalStepping
 
 class VideoInterfaceManager
 {
+  friend struct ::StaticRecompNativeViChassis::Access;  // phase D/S: savestate seeding
+
 public:
   explicit VideoInterfaceManager(Core::System& system);
   VideoInterfaceManager(const VideoInterfaceManager&) = delete;

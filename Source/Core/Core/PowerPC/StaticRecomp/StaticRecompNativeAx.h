@@ -16,14 +16,16 @@
 #include <array>
 #include <map>
 #include <optional>
+#include <string>
+#include <vector>
 
-#include "Common/CommonTypes.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompTypes.h"
 
-class PointerWrap;
+#include "Core/PowerPC/StaticRecomp/StaticRecompGuestMemory.h"
 
-namespace Memory
+namespace StaticRecompState
 {
-class MemoryManager;
+class StateStream;
 }
 
 namespace StaticRecompNativeAudio
@@ -31,7 +33,7 @@ namespace StaticRecompNativeAudio
 class NativeAxWii
 {
 public:
-  explicit NativeAxWii(Memory::MemoryManager& memory);
+  explicit NativeAxWii(const StaticRecompGuestMemory::GuestMemory& memory);
   ~NativeAxWii();
 
   // Microcode the game booted (Dolphin's ector CRC). False: not supported.
@@ -50,7 +52,10 @@ public:
   u32 CompareOverlay(u32* first) const;
   void ClearOverlay() { m_overlay.clear(); }
 
-  void DoState(PointerWrap& p);
+  void DoState(StaticRecompState::StateStream& p);
+  // The resampling table files, in order of preference (the user's
+  // dsp_coef.bin, then the bundled Sys/GC one).
+  static void SetCoefficientPaths(std::vector<std::string> paths);
 
 private:
   class Accelerator;
@@ -75,7 +80,28 @@ private:
   void OutputWMSamples(const u32* addresses);
   void LoadResamplingCoefficients();
 
-  Memory::MemoryManager& m_memory;
+  StaticRecompGuestMemory::GuestMemory m_memory;
+  // Direct RAM/EXRAM view for the parameter-block and buffer accesses (the
+  // generic range lookup cost ~1.4 % of the CPU thread in combat).
+  u8* m_ram = nullptr;
+  u8* m_exram = nullptr;
+  u32 m_ram_size = 0;
+  u32 m_exram_size = 0;
+  void ReadWords(u32 address, u16* words, size_t count) const;
+  void WriteWords(u32 address, const u16* words, size_t count);
+  // Called for every parameter-block word: inline.
+  u8* FastPointer(u32 address, u32 size) const
+  {
+    // The same regions the generic lookup accepts: MEM1 as physical, cached or
+    // uncached (0x0/0x8/0xC) and MEM2 (0x1/0x9/0xD); anything else is not RAM.
+    const u32 region = address & 0xF8000000u;
+    const u32 offset = address & 0x07FFFFFFu;
+    if (region == 0x00000000u || region == 0x80000000u || region == 0xC0000000u)
+      return m_ram && u64(offset) + size <= m_ram_size ? m_ram + offset : nullptr;
+    if (region == 0x10000000u || region == 0x90000000u || region == 0xD0000000u)
+      return m_exram && u64(offset) + size <= m_exram_size ? m_exram + offset : nullptr;
+    return nullptr;
+  }
   bool m_use_overlay = false;
   std::map<u32, u8> m_overlay;
 

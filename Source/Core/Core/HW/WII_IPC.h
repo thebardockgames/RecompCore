@@ -134,6 +134,7 @@ public:
   bool IsReady() const;
 
   Common::Flags<GPIO> GetGPIOOutFlags() const { return m_gpio_out; }
+  Common::Flags<GPIO> GetGPIODirFlags() const { return m_gpio_dir; }  // RecompCore: seed of the native GPIO
 
 private:
   void InitState();

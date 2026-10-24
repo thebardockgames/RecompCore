@@ -28,9 +28,10 @@
 #include <string>
 #include <vector>
 
-#include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeSdk.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeThp.h"
+
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeBat.h"
 
 // Each operation rounds to single precision on its own (no contraction into
 // fused multiply-add), as the recompiled paired-single code does.
@@ -41,31 +42,10 @@ namespace StaticRecompNativeSdk
 {
 namespace
 {
-constexpr u32 kSda = 0x806370A0;
-constexpr u32 kThpVideoDecode = 0x80305C20;
-constexpr u32 kThpInitFlag = kSda - 0x5CE0;  // __THPInitFlag
-constexpr u32 kAanScaleFactor = 0x8036D178;  // f64 __THPAANScaleFactor[8]
-constexpr u32 kJpegNaturalOrder = 0x8036D128;  // u8 __THPJpegNaturalOrder[80]
+#include "native/thp.inc"  // the game's addresses and fingerprints
 constexpr u32 kHid2LockedCache = 0x10000000;
 constexpr s64 kThpCycles = 20000;
 
-constexpr std::array<CodeFingerprint, 15> kThpCode = {{
-    {0x80305C20u, 704u, 0xE546D871D0109609ull},   // THPVideoDecode
-    {0x80305EE0u, 308u, 0xEA866E4AC699898Cull},   // __THPReadFrameHeader
-    {0x80306014u, 276u, 0x371FE742EBCBF27Aull},   // __THPReadScaneHeader
-    {0x80306128u, 920u, 0x48EAAAAE993E79A2ull},   // __THPReadQuantizationTable
-    {0x803064C0u, 964u, 0x6217AE6F43C909DBull},   // __THPReadHuffmanTableSpecification
-    {0x80306884u, 584u, 0x25617532293A6A40ull},   // __THPPrepBitStream
-    {0x80306ACCu, 260u, 0x52FBDA71CC1600CAull},   // __THPDecompressYUV
-    {0x80306BD0u, 588u, 0xB86B968ED60C5A80ull},   // __THPDecompressiMCURow512x448
-    {0x80306E1Cu, 1164u, 0x1A7596E91AFA62FCull},  // __THPInverseDCTNoYPos
-    {0x803072A8u, 1172u, 0x26649259000CC70Cull},  // __THPInverseDCTY8
-    {0x8030773Cu, 592u, 0xD901E63AE3605DFDull},   // __THPDecompressiMCURow640x480
-    {0x8030798Cu, 604u, 0xEAA33AD589FE49E7ull},   // __THPDecompressiMCURowNxN
-    {0x80307BE8u, 1628u, 0x52CDC352AE8A9BABull},  // __THPHuffDecodeDCTCompY
-    {0x80308244u, 1672u, 0xC0DA93510BE11707ull},  // __THPHuffDecodeDCTCompU
-    {0x803088CCu, 1672u, 0x2CBB4F0FBDF0EC57ull},  // __THPHuffDecodeDCTCompV
-}};
 
 struct Pair
 {
@@ -662,7 +642,7 @@ bool NativeSdk::ThpReadGuest(const CPUState& guest, u32 address, size_t size, st
   while (done < size)
   {
     const u32 at = address + static_cast<u32>(done);
-    const u32 page_left = PowerPC::BAT_PAGE_SIZE - (at & (PowerPC::BAT_PAGE_SIZE - 1));
+    const u32 page_left = StaticRecompNativeBat::kPageSize - (at & (StaticRecompNativeBat::kPageSize - 1));
     const u32 n = static_cast<u32>(std::min<size_t>(size - done, page_left));
     const u8* p = Pointer(guest, at, n);
     if (!p)
@@ -679,7 +659,7 @@ bool NativeSdk::ThpWriteGuest(const CPUState& guest, u32 address, const std::vec
   while (done < data.size())
   {
     const u32 at = address + static_cast<u32>(done);
-    const u32 page_left = PowerPC::BAT_PAGE_SIZE - (at & (PowerPC::BAT_PAGE_SIZE - 1));
+    const u32 page_left = StaticRecompNativeBat::kPageSize - (at & (StaticRecompNativeBat::kPageSize - 1));
     const u32 n = static_cast<u32>(std::min<size_t>(data.size() - done, page_left));
     u8* p = Pointer(guest, at, n);
     if (!p)

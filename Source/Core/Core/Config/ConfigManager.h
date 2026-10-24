@@ -69,6 +69,9 @@ struct SConfig
   void SetRunningGameMetadata(const DiscIO::Volume& volume, const DiscIO::Partition& partition);
   void SetRunningGameMetadata(const IOS::ES::TMDReader& tmd, DiscIO::Platform platform);
   void SetRunningGameMetadata(const std::string& game_id);
+  // RecompCore: the native boot sets the full metadata without a volume.
+  void SetRunningGameMetadata(const std::string& game_id, const std::string& gametdb_id,
+                              u64 title_id, u16 revision, DiscIO::Region region);
 
   // Triggered when Dolphin loads a title directly
   // Reloads title-specific map files, patches, etc.
@@ -117,9 +120,6 @@ private:
   ~SConfig();
 
   static void ReloadTextures(Core::System& system);
-
-  void SetRunningGameMetadata(const std::string& game_id, const std::string& gametdb_id,
-                              u64 title_id, u16 revision, DiscIO::Region region);
 
   static SConfig* m_Instance;
   mutable std::recursive_mutex m_metadata_lock;

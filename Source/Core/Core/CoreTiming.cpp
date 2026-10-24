@@ -23,6 +23,7 @@
 #include "Core/Core.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeClock.h"
 #include "Core/System.h"
 
 #include "VideoCommon/Fifo.h"
@@ -169,9 +170,60 @@ void CoreTimingManager::RefreshConfig()
   m_use_precision_timer = Config::Get(Config::MAIN_PRECISION_FRAME_TIMING);
 }
 
+StaticRecompNativeClock::ChassisSnapshot CoreTimingManager::DetachForNativeClock()
+{
+  StaticRecompNativeClock::ChassisSnapshot snapshot;
+  MoveEvents();
+  snapshot.ticks = m_globals.global_timer;
+  snapshot.slice_length = m_globals.slice_length;
+  snapshot.idled = m_idled_cycles;
+  for (const Event& ev : m_event_queue)
+    snapshot.events.push_back({ev.time, ev.fifo_order, ev.userdata, ev.type});
+  m_event_queue.clear();
+  return snapshot;
+}
+
+void CoreTimingManager::AttachFromNativeClock(
+    const StaticRecompNativeClock::ChassisSnapshot& snapshot)
+{
+  m_globals.global_timer = snapshot.ticks;
+  m_globals.slice_length = snapshot.slice_length;
+  m_idled_cycles = snapshot.idled;
+  m_event_queue.clear();
+  for (const auto& ev : snapshot.events)
+    m_event_queue.emplace_back(Event{ev.time, m_event_fifo_id++, ev.userdata, ev.type});
+  std::ranges::make_heap(m_event_queue, std::ranges::greater{});
+}
+
+void CoreTimingManager::ResetCounterForLoad(s64 ticks)
+{
+  if (m_native_clock)
+  {
+    m_native_clock->LoadCounter(ticks);
+    return;
+  }
+  m_globals.global_timer = ticks;
+  m_globals.slice_length = 0;
+  m_system.GetPPCState().downcount = 0;
+  ClearPendingEvents();
+}
+
 void CoreTimingManager::DoState(PointerWrap& p)
 {
   std::lock_guard lk(m_ts_write_lock);
+  // Facade: the native clock holds the counter and the events of the chassis's
+  // devices. Write them in the chassis's own layout (states stay compatible
+  // both ways) and give them back to the native clock after a load.
+  if (m_native_clock && !p.IsReadMode())
+    AttachFromNativeClock(m_native_clock->ExportChassis());
+  Common::ScopeGuard facade_guard{[&] {
+    if (!m_native_clock)
+      return;
+    if (p.IsReadMode())
+      m_native_clock->ImportChassis(DetachForNativeClock());
+    else
+      m_event_queue.clear();
+  }};
   p.Do(m_globals.slice_length);
   p.Do(m_globals.global_timer);
   p.Do(m_idled_cycles);
@@ -236,6 +288,8 @@ void CoreTimingManager::DoState(PointerWrap& p)
 // it from any other thread, you are doing something evil
 u64 CoreTimingManager::GetTicks() const
 {
+  if (m_native_clock)
+    return m_native_clock->Now();
   u64 ticks = static_cast<u64>(m_globals.global_timer);
   if (!m_is_global_timer_sane)
   {
@@ -247,11 +301,15 @@ u64 CoreTimingManager::GetTicks() const
 
 u64 CoreTimingManager::GetIdleTicks() const
 {
+  if (m_native_clock)
+    return static_cast<u64>(m_native_clock->IdledCycles());
   return static_cast<u64>(m_idled_cycles);
 }
 
 void CoreTimingManager::ClearPendingEvents()
 {
+  if (m_native_clock)
+    m_native_clock->ClearAll();
   m_event_queue.clear();
 }
 
@@ -271,6 +329,12 @@ void CoreTimingManager::ScheduleEvent(s64 cycles_into_future, EventType* event_t
     ASSERT_MSG(POWERPC, from_cpu_thread == Core::IsCPUThread(),
                "A \"{}\" event was scheduled from the wrong thread ({})", *event_type->name,
                from_cpu_thread ? "CPU" : "non-CPU");
+  }
+
+  if (m_native_clock)
+  {
+    m_native_clock->ScheduleChassis(cycles_into_future, event_type, userdata, from_cpu_thread);
+    return;
   }
 
   if (from_cpu_thread)
@@ -301,6 +365,11 @@ void CoreTimingManager::ScheduleEvent(s64 cycles_into_future, EventType* event_t
 
 void CoreTimingManager::RemoveEvent(EventType* event_type)
 {
+  if (m_native_clock)
+  {
+    m_native_clock->RemoveChassis(event_type);
+    return;
+  }
   const size_t erased =
       std::erase_if(m_event_queue, [&](const Event& e) { return e.type == event_type; });
 
@@ -319,6 +388,11 @@ void CoreTimingManager::RemoveAllEvents(EventType* event_type)
 
 void CoreTimingManager::ForceExceptionCheck(s64 cycles)
 {
+  if (m_native_clock)
+  {
+    m_native_clock->ForceExceptionCheck(cycles);
+    return;
+  }
   cycles = std::max<s64>(0, cycles);
   auto& ppc_state = m_system.GetPPCState();
   if (DowncountToCycles(ppc_state.downcount) > cycles)
@@ -332,6 +406,8 @@ void CoreTimingManager::ForceExceptionCheck(s64 cycles)
 
 void CoreTimingManager::MoveEvents()
 {
+  if (m_native_clock)
+    m_native_clock->MoveCrossThread();
   while (!m_ts_queue.Empty())
   {
     auto& ev = m_event_queue.emplace_back(m_ts_queue.Front());
@@ -346,6 +422,11 @@ void CoreTimingManager::MoveEvents()
 
 void CoreTimingManager::Advance()
 {
+  if (m_native_clock)
+  {
+    m_native_clock->Slice();
+    return;
+  }
   CPUThreadConfigCallback::CheckForConfigChanges();
 
   MoveEvents();
@@ -401,6 +482,8 @@ bool CoreTimingManager::IsSpeedUnlimited() const
 
 TimePoint CoreTimingManager::GetTargetHostTime(s64 target_cycle)
 {
+  if (m_native_target_host_time)
+    return m_native_target_host_time(target_cycle);
   if (IsSpeedUnlimited())
     return Clock::now();
 
@@ -573,6 +656,11 @@ void CoreTimingManager::AdjustEventQueueTimes(u32 new_ppc_clock, u32 old_ppc_clo
 
 void CoreTimingManager::Idle()
 {
+  if (m_native_clock)
+  {
+    m_native_clock->Idle();
+    return;
+  }
   if (m_config_sync_on_skip_idle)
   {
     // When the FIFO is processing data we must not advance because in this way

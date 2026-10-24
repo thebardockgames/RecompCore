@@ -9,11 +9,11 @@
 #include <memory>
 #include <utility>
 
-#include "Common/CommonTypes.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompTypes.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeAx.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeSdk.h"
 
-namespace CoreTiming
+namespace StaticRecompNativeClock
 {
 struct EventType;
 }
@@ -58,15 +58,26 @@ struct NativeSdk::AudioState
   // being played.
   u16 dma_hi = 0, dma_lo = 0, dma_control = 0;
   u32 play_address = 0, play_blocks = 0;
-  u64 block_start = 0;     // CoreTiming ticks at the start of the block
+  u64 block_start = 0;     // clock cycles at the start of the block
   u64 ticks_per_32_bytes = 0;
   bool dma_running = false;
-  CoreTiming::EventType* dma_event = nullptr;
+  StaticRecompNativeClock::EventType* dma_event = nullptr;
   u32 pending_ai_interrupts = 0;
+
+  // The AI register page as the game sees it (seeded from the chassis once).
+  bool ai_regs_seeded = false;
+  u32 ai_control = 0, ai_volume = 0, ai_interrupt_timing = 0;
+  bool dsp_control_seeded = false;
+  u16 dsp_control = 0;
 
   // Statistics.
   u64 command_lists = 0, command_list_errors = 0, dsp_interrupts = 0, ai_interrupts = 0;
   u64 dma_blocks = 0, samples_out = 0, unknown_mails = 0;
+  // FNV-1a of the first samples sent to the output (identity check of the
+  // mixer; MODERNGEKKO_AUDIO_HASH_SAMPLES, default 640000 = 20 s at 32 kHz,
+  // so runs of different lengths compare).
+  u64 output_hash = 0xcbf29ce484222325ull;
+  u64 output_hash_samples = 0;
   u64 verified = 0, mismatches = 0;
 };
 }  // namespace StaticRecompNativeSdk

@@ -400,6 +400,8 @@ void FifoManager::RunGpuLoop()
 
 void FifoManager::FlushGpu()
 {
+  // The native GP front (phase E) has its own thread to wait for.
+  NativeGXBridge::FlushGp();
   if (!m_system.IsDualCoreMode() || m_use_deterministic_gpu_thread)
     return;
 

@@ -102,6 +102,14 @@ RECOMP_MODULE_EXPORT u32 staticrecomp_native_hooks(const u32** addresses, unsign
     *any = &dolrecomp_native_hooks_any;
     return DOLRECOMP_NATIVE_HOOK_COUNT;
 }
+
+// Inline native replacements (one per hooked function, null by default),
+// filled by the runtime before code runs.
+RECOMP_MODULE_EXPORT u32 staticrecomp_native_inline(DolRecompNativeInline** table)
+{
+    *table = dolrecomp_native_inline;
+    return DOLRECOMP_NATIVE_HOOK_COUNT;
+}
 #endif
 
 RECOMP_MODULE_EXPORT const StaticRecompModuleDesc* staticrecomp_get_module(void)

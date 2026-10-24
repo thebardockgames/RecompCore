@@ -50,6 +50,10 @@ public:
   // Mixer::FIXED_SAMPLE_RATE_DIVIDEND will be the dividend used for these divisors
   u32 GetAIDSampleRateDivisor() const;
   u32 GetAISSampleRateDivisor() const;
+  // RecompCore: seeds of the native AI register page.
+  u32 GetControlRegister() const { return m_control.hex; }
+  u32 GetVolumeRegister() const { return m_volume.hex; }
+  u32 GetInterruptTiming() const { return m_interrupt_timing; }
 
   // The configured sample rate based on the control registers. Note that on GameCube, the named
   // rates are slightly higher than the names would suggest due to a hardware bug.

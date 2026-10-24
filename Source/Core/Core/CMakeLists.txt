@@ -614,21 +614,98 @@ add_library(core
   PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp
   PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
   PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+  PowerPC/StaticRecomp/StaticRecompHostAudio.cpp
+  PowerPC/StaticRecomp/StaticRecompHostAudio.h
+  PowerPC/StaticRecomp/StaticRecompHostInput.cpp
+  PowerPC/StaticRecomp/StaticRecompHostInput.h
   PowerPC/StaticRecomp/StaticRecompNativeSdk.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeInline.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeMath.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeMath.h
   PowerPC/StaticRecomp/StaticRecompNativeSdk.h
+  PowerPC/StaticRecomp/StaticRecompNativeSdkChassis.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeSdkChassis.h
   PowerPC/StaticRecomp/StaticRecompNativeAudio.cpp
   PowerPC/StaticRecomp/StaticRecompNativeAudio.h
   PowerPC/StaticRecomp/StaticRecompNativeAx.cpp
   PowerPC/StaticRecomp/StaticRecompNativeAx.h
+  PowerPC/StaticRecomp/StaticRecompAxStructs.h
+  PowerPC/StaticRecomp/StaticRecompDspAccelerator.h
+  PowerPC/StaticRecomp/StaticRecompUtil.h
   PowerPC/StaticRecomp/StaticRecompNativeFs.cpp
   PowerPC/StaticRecomp/StaticRecompNativeFs.h
+  PowerPC/StaticRecomp/StaticRecompNativeNand.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeNand.h
+  PowerPC/StaticRecomp/StaticRecompFsTypes.h
   PowerPC/StaticRecomp/StaticRecompNativeMods.cpp
   PowerPC/StaticRecomp/StaticRecompNativeMods.h
   PowerPC/StaticRecomp/StaticRecompNativePad.cpp
   PowerPC/StaticRecomp/StaticRecompNativePad.h
   PowerPC/StaticRecomp/StaticRecompNativeThp.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeGp.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeVi.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeVi.h
+  PowerPC/StaticRecomp/StaticRecompNativeViChassis.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeViChassis.h
+  PowerPC/StaticRecomp/StaticRecompNativeBoot.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeBoot.h
+  PowerPC/StaticRecomp/StaticRecompNativeBootChassis.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeBootChassis.h
+  PowerPC/StaticRecomp/StaticRecompIosMemoryValues.h
+  PowerPC/StaticRecomp/StaticRecompNativeState.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeState.h
+  PowerPC/StaticRecomp/StaticRecompNativeStateChassis.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeStateChassis.h
+  PowerPC/StaticRecomp/StaticRecompNativeClock.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeClock.h
+  PowerPC/StaticRecomp/StaticRecompNativeClockChassis.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeClockChassis.h
+  PowerPC/StaticRecomp/StaticRecompGuestMemory.cpp
+  PowerPC/StaticRecomp/StaticRecompGuestMemory.h
+  PowerPC/StaticRecomp/StaticRecompGuestRam.cpp
+  PowerPC/StaticRecomp/StaticRecompGuestRam.h
+  PowerPC/StaticRecomp/StaticRecompGuestRegs.h
+  PowerPC/StaticRecomp/StaticRecompTypes.h
+  PowerPC/StaticRecomp/StaticRecompFrameEvents.cpp
+  PowerPC/StaticRecomp/StaticRecompFrameEvents.h
+  PowerPC/StaticRecomp/StaticRecompHostLoop.cpp
+  PowerPC/StaticRecomp/StaticRecompHostLoop.h
+  PowerPC/StaticRecomp/StaticRecompNativeGx.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeGx.h
+  PowerPC/StaticRecomp/StaticRecompStateStream.h
+  PowerPC/StaticRecomp/StaticRecompNativeExi.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeExi.h
+  PowerPC/StaticRecomp/StaticRecompNativeBat.h
+  PowerPC/StaticRecomp/StaticRecompNativePi.cpp
+  PowerPC/StaticRecomp/StaticRecompNativePi.h
+  PowerPC/StaticRecomp/StaticRecompNativePiChassis.cpp
+  PowerPC/StaticRecomp/StaticRecompNativePiChassis.h
+  PowerPC/StaticRecomp/StaticRecompNativeGp.h
+  PowerPC/StaticRecomp/StaticRecompNativeGpChassis.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeGpChassis.h
+  PowerPC/StaticRecomp/StaticRecompNativeWud.cpp
+  PowerPC/StaticRecomp/StaticRecompNativeWud.h
   PowerPC/StaticRecomp/StaticRecompNativeThp.h
   PowerPC/StaticRecomp/StaticRecompCore.h
+  PowerPC/StaticRecomp/StaticRecompSysConf.cpp
+  PowerPC/StaticRecomp/StaticRecompSysConf.h
+  PowerPC/StaticRecomp/StaticRecompPowerOn.h
+  PowerPC/StaticRecomp/StaticRecompCpuHost.h
+  PowerPC/StaticRecomp/StaticRecompExceptions.h
+  PowerPC/StaticRecomp/StaticRecompBurst.cpp
+  PowerPC/StaticRecomp/StaticRecompBurst.h
+  PowerPC/StaticRecomp/StaticRecompCodeGuard.cpp
+  PowerPC/StaticRecomp/StaticRecompCodeGuard.h
+  PowerPC/StaticRecomp/StaticRecompModuleLoader.cpp
+  PowerPC/StaticRecomp/StaticRecompModuleLoader.h
+  PowerPC/StaticRecomp/StaticRecompMachine.cpp
+  PowerPC/StaticRecomp/StaticRecompMachine.h
+  PowerPC/StaticRecomp/StaticRecompHostLoopChassis.cpp
+  PowerPC/StaticRecomp/StaticRecompHostLoopChassis.h
+  PowerPC/StaticRecomp/StaticRecompMemoryChassis.h
+  PowerPC/StaticRecomp/StaticRecompKernelChassis.cpp
+  PowerPC/StaticRecomp/StaticRecompKernelChassis.h
+  PowerPC/StaticRecomp/StaticRecompOpCycles.h
   PowerPC/StaticRecomp/StaticRecompModuleSource.h
   PowerPC/StaticRecomp/StaticRecompLockstep.cpp
   PowerPC/StaticRecomp/StaticRecompLockstep.h
@@ -770,6 +847,7 @@ endif()
 
 target_link_libraries(core
 PUBLIC
+  moderngekko_native_gx
   audiocommon
   common
   discio

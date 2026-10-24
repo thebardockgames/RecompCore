@@ -9,28 +9,29 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <fstream>
 #include <string>
+#include <vector>
 
-#include "Common/ChunkFile.h"
-#include "Common/CommonPaths.h"
-#include "Common/FileUtil.h"
-#include "Common/Hash.h"
-#include "Common/IOFile.h"
-#include "Common/MathUtil.h"
-#include "Common/Swap.h"
-#include "Core/DSP/DSPAccelerator.h"
-#include "Core/HW/DSPHLE/UCodes/AXStructs.h"
-#include "Core/HW/Memmap.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompStateStream.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompAxStructs.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompDspAccelerator.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompUtil.h"
 
 namespace StaticRecompNativeAudio
 {
 namespace
 {
-using DSP::HLE::AXPBWii;
-using DSP::HLE::PBBiquadFilter;
-using DSP::HLE::PBLowPassFilter;
-using DSP::HLE::PBUpdatesWii;
-using DSP::HLE::VolumeData;
+using StaticRecompAx::AXPBWii;
+using StaticRecompAx::PBBiquadFilter;
+using StaticRecompAx::PBLowPassFilter;
+using StaticRecompAx::PBUpdatesWii;
+using StaticRecompAx::VolumeData;
+
+std::vector<std::string> s_coefficient_paths;
 
 #define HILO_TO_32(name) ((u32(name##_hi) << 16) | name##_lo)
 
@@ -179,7 +180,7 @@ u32 ResampleAudio(Input&& input_callback, s16* output, u32 count, s16* last_samp
       s64 t2 = temp[idx++ & 3];
       s64 t3 = temp[idx++ & 3];
       s64 samp = (t0 * c[0] + t1 * c[1] + t2 * c[2] + t3 * c[3]) >> 15;
-      output[i] = MathUtil::SaturatingCast<s16>(samp);
+      output[i] = StaticRecompUtil::SaturatingCast<s16>(samp);
     }
     last_samples[3] = temp[--idx & 3];
     last_samples[2] = temp[--idx & 3];
@@ -302,15 +303,13 @@ struct Buffers
 
 // The sample decoder of the DSP (ADPCM / PCM), reading guest memory the way
 // Wii AX addresses it (bit 28: MEM2).
-class NativeAxWii::Accelerator final : public DSP::Accelerator
+class NativeAxWii::Accelerator final : public StaticRecompDsp::Accelerator
 {
 public:
   explicit Accelerator(const NativeAxWii& owner) : m_owner(owner) {}
   AXPBWii* acc_pb = nullptr;
 
 protected:
-  void OnRawReadEndException() override {}
-  void OnRawWriteEndException() override {}
   void OnSampleReadEndException() override
   {
     if (acc_pb->audio_addr.looping)
@@ -333,20 +332,23 @@ protected:
     }
   }
   u8 ReadMemory(u32 address) override { return m_owner.ReadSampleMemory(address); }
-  void WriteMemory(u32, u8) override {}
 
 private:
   const NativeAxWii& m_owner;
 };
 
-NativeAxWii::NativeAxWii(Memory::MemoryManager& memory) : m_memory(memory)
+NativeAxWii::NativeAxWii(const StaticRecompGuestMemory::GuestMemory& memory) : m_memory(memory)
 {
+  m_ram = memory.GetRAM();
+  m_ram_size = memory.GetRamSizeReal();
+  m_exram = memory.GetEXRAM();
+  m_exram_size = memory.GetExRamSizeReal();
   LoadResamplingCoefficients();
 }
 
 NativeAxWii::~NativeAxWii() = default;
 
-void NativeAxWii::DoState(PointerWrap& p)
+void NativeAxWii::DoState(StaticRecompState::StateStream& p)
 {
   p.Do(m_samples_main_left);
   p.Do(m_samples_main_right);
@@ -373,6 +375,11 @@ void NativeAxWii::DoState(PointerWrap& p)
   p.Do(m_compressor_pos);
 }
 
+void NativeAxWii::SetCoefficientPaths(std::vector<std::string> paths)
+{
+  s_coefficient_paths = std::move(paths);
+}
+
 bool NativeAxWii::SupportsCrc(u32 crc)
 {
   return crc == 0x347112ba || crc == 0x4cc52064;
@@ -380,23 +387,22 @@ bool NativeAxWii::SupportsCrc(u32 crc)
 
 void NativeAxWii::LoadResamplingCoefficients()
 {
-  // Same files and order as Dolphin's HLE (AXUCode::LoadResamplingCoefficients).
+  // Same files and order as Dolphin's HLE (AXUCode::LoadResamplingCoefficients):
+  // the user's dsp_coef.bin, then the bundled one (SetCoefficientPaths).
   constexpr size_t raw_coeffs_size = 0x800 * 2;
-  const std::string filenames[] = {
-      File::GetUserPath(D_GCUSER_IDX) + "dsp_coef.bin",
-      File::GetSysDirectory() + "/GC/dsp_coef.bin",
-  };
-  for (const std::string& filename : filenames)
+  for (const std::string& filename : s_coefficient_paths)
   {
-    if (File::GetSize(filename) != raw_coeffs_size)
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    if (!file || static_cast<size_t>(file.tellg()) != raw_coeffs_size)
       continue;
-    File::IOFile fp(filename, "rb");
+    file.seekg(0);
     std::array<u8, raw_coeffs_size> raw_coeffs;
-    fp.ReadBytes(raw_coeffs.data(), raw_coeffs_size);
-    m_coeffs_checksum = Common::HashAdler32(raw_coeffs.data(), raw_coeffs_size);
+    if (!file.read(reinterpret_cast<char*>(raw_coeffs.data()), raw_coeffs_size))
+      continue;
+    m_coeffs_checksum = StaticRecompUtil::Adler32(raw_coeffs.data(), raw_coeffs_size);
     std::memcpy(m_coeffs.data(), raw_coeffs.data(), raw_coeffs_size);
     for (auto& coef : m_coeffs)
-      coef = Common::swap16(coef);
+      coef = static_cast<s16>(StaticRecompUtil::Swap16(static_cast<u16>(coef)));
     return;
   }
 }
@@ -410,6 +416,8 @@ void NativeAxWii::SetOverlay(bool enabled)
 u32 NativeAxWii::CompareOverlay(u32* first) const
 {
   u32 differences = 0;
+  static int reports = 0;
+  const bool report = reports < 3;
   for (const auto& [address, value] : m_overlay)
   {
     const u8* p = m_memory.GetPointerForRange(address, 1);
@@ -417,8 +425,13 @@ u32 NativeAxWii::CompareOverlay(u32* first) const
     {
       if (differences++ == 0 && first)
         *first = address;
+      if (report && differences <= 24)
+        std::fprintf(stderr, "[native_audio] verify detail: %08x native=%02x emulated=%02x\n", address, value,
+                     p ? *p : 0xFFu);
     }
   }
+  if (report && differences)
+    ++reports;
   return differences;
 }
 
@@ -430,7 +443,7 @@ u8 NativeAxWii::Read8(u32 address) const
     if (it != m_overlay.end())
       return it->second;
   }
-  const u8* p = m_memory.GetPointerForRange(address, 1);
+  const u8* p = FastPointer(address, 1);
   return p ? *p : 0;
 }
 
@@ -441,7 +454,7 @@ void NativeAxWii::Write8(u32 address, u8 value)
     m_overlay[address] = value;
     return;
   }
-  if (u8* p = m_memory.GetPointerForRange(address, 1))
+  if (u8* p = FastPointer(address, 1))
     *p = value;
 }
 
@@ -449,7 +462,7 @@ u16 NativeAxWii::Read16(u32 address) const
 {
   if (!m_use_overlay)
   {
-    const u8* p = m_memory.GetPointerForRange(address, 2);
+    const u8* p = FastPointer(address, 2);
     return p ? static_cast<u16>((p[0] << 8) | p[1]) : 0;
   }
   return static_cast<u16>((Read8(address) << 8) | Read8(address + 1));
@@ -459,7 +472,7 @@ void NativeAxWii::Write16(u32 address, u16 value)
 {
   if (!m_use_overlay)
   {
-    if (u8* p = m_memory.GetPointerForRange(address, 2))
+    if (u8* p = FastPointer(address, 2))
     {
       p[0] = static_cast<u8>(value >> 8);
       p[1] = static_cast<u8>(value);
@@ -468,6 +481,35 @@ void NativeAxWii::Write16(u32 address, u16 value)
   }
   Write8(address, static_cast<u8>(value >> 8));
   Write8(address + 1, static_cast<u8>(value));
+}
+
+void NativeAxWii::ReadWords(u32 address, u16* words, size_t count) const
+{
+  // One region check for the whole run (the parameter blocks are read and
+  // written every millisecond of audio); word by word otherwise.
+  if (const u8* p = m_use_overlay ? nullptr : FastPointer(address, static_cast<u32>(count * 2)))
+  {
+    for (size_t i = 0; i < count; ++i)
+      words[i] = static_cast<u16>((p[i * 2] << 8) | p[i * 2 + 1]);
+    return;
+  }
+  for (size_t i = 0; i < count; ++i)
+    words[i] = Read16(address + static_cast<u32>(i * 2));
+}
+
+void NativeAxWii::WriteWords(u32 address, const u16* words, size_t count)
+{
+  if (u8* p = m_use_overlay ? nullptr : FastPointer(address, static_cast<u32>(count * 2)))
+  {
+    for (size_t i = 0; i < count; ++i)
+    {
+      p[i * 2] = static_cast<u8>(words[i] >> 8);
+      p[i * 2 + 1] = static_cast<u8>(words[i]);
+    }
+    return;
+  }
+  for (size_t i = 0; i < count; ++i)
+    Write16(address + static_cast<u32>(i * 2), words[i]);
 }
 
 u32 NativeAxWii::Read32(u32 address) const
@@ -483,10 +525,15 @@ void NativeAxWii::Write32(u32 address, u32 value)
 
 u8 NativeAxWii::ReadSampleMemory(u32 address) const
 {
-  // DSPManager::ReadARAM in Wii mode.
+  // DSPManager::ReadARAM in Wii mode: the address masked to the region's
+  // power-of-two size; past the real RAM reads as 0.
   if (address & 0x10000000)
-    return m_memory.GetEXRAM()[address & m_memory.GetExRamMask()];
-  return m_memory.GetRAM()[address & m_memory.GetRamMask()];
+  {
+    const u32 offset = address & m_memory.GetExRamMask();
+    return offset < m_memory.GetExRamSizeReal() ? m_memory.GetEXRAM()[offset] : 0;
+  }
+  const u32 offset = address & m_memory.GetRamMask();
+  return offset < m_memory.GetRamSizeReal() ? m_memory.GetRAM()[offset] : 0;
 }
 
 bool NativeAxWii::ExecuteCommandList(u32 address, u16 size)
@@ -630,6 +677,49 @@ void NativeAxWii::AddSubToLR(u32 val_addr)
     m_samples_main_right[i] -= static_cast<int>(Read32(val_addr + (96 + i) * 4));
 }
 
+namespace
+{
+// MODERNGEKKO_AX_CLIP_STATS=1: which voices saturate, and where (diagnosis
+// only; the samples are not changed). Printed at exit.
+struct ClipStats
+{
+  struct Voice
+  {
+    u64 frames = 0, resample_clips = 0, envelope_clips = 0, mix_clips = 0;
+    u32 format = 0, src_type = 0, coef = 0, ratio = 0;
+    u32 max_volume = 0, max_mix = 0, max_abs_in = 0;
+  };
+  bool enabled = std::getenv("MODERNGEKKO_AX_CLIP_STATS") != nullptr;
+  std::map<u32, Voice> voices;
+  u64 output_samples = 0, output_clips = 0;
+  ~ClipStats()
+  {
+    if (!enabled)
+      return;
+    std::vector<std::pair<u32, Voice>> list(voices.begin(), voices.end());
+    std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) {
+      return a.second.resample_clips + a.second.envelope_clips + a.second.mix_clips >
+             b.second.resample_clips + b.second.envelope_clips + b.second.mix_clips;
+    });
+    std::fprintf(stderr, "[ax_clip] output samples=%llu clipped=%llu voices=%zu\n",
+                 static_cast<unsigned long long>(output_samples), static_cast<unsigned long long>(output_clips),
+                 list.size());
+    for (size_t i = 0; i < list.size() && i < 25; ++i)
+    {
+      const Voice& v = list[i].second;
+      std::fprintf(stderr,
+                   "[ax_clip] pb=%08x frames=%llu resample=%llu envelope=%llu mix=%llu fmt=%u src=%u coef=%u "
+                   "ratio=%08x max_in=%u max_env_vol=%04x max_mix_vol=%04x\n",
+                   list[i].first, static_cast<unsigned long long>(v.frames),
+                   static_cast<unsigned long long>(v.resample_clips),
+                   static_cast<unsigned long long>(v.envelope_clips), static_cast<unsigned long long>(v.mix_clips),
+                   v.format, v.src_type, v.coef, v.ratio, v.max_abs_in, v.max_volume, v.max_mix);
+    }
+  }
+};
+ClipStats s_clip_stats;
+}  // namespace
+
 void NativeAxWii::ProcessPBList(u32 pb_addr)
 {
   constexpr size_t updates_begin = offsetof(AXPBWii, updates);
@@ -645,11 +735,11 @@ void NativeAxWii::ProcessPBList(u32 pb_addr)
     // Microcode 0x347112ba: the guest PB has no `updates` field.
     AXPBWii pb;
     u16* words = reinterpret_cast<u16*>(&pb);
-    for (size_t i = 0; i < updates_begin / 2; ++i)
-      words[i] = Read16(pb_addr + static_cast<u32>(i * 2));
+    ReadWords(pb_addr, words, updates_begin / 2);
     std::memset(reinterpret_cast<u8*>(&pb) + updates_begin, 0, sizeof(PBUpdatesWii));
-    for (size_t i = updates_end / 2; i < sizeof(pb) / 2; ++i)
-      words[i] = Read16(pb_addr + static_cast<u32>(i * 2 - sizeof(PBUpdatesWii)));
+    ReadWords(pb_addr + static_cast<u32>(updates_begin), words + updates_end / 2,
+              sizeof(pb) / 2 - updates_end / 2);
+    const bool running = pb.running == 1;
 
     if (pb.running == 1)
     {
@@ -678,6 +768,25 @@ void NativeAxWii::ProcessPBList(u32 pb_addr)
           [&](u32) { return static_cast<s16>(accelerator.ReadSample(pb.adpcm.coefs)); }, samples,
           count, pb.src.last_samples, pb.src.cur_addr_frac, HILO_TO_32(pb.src.ratio), pb.src_type,
           voice_coeffs);
+      ClipStats::Voice* clip = nullptr;
+      if (s_clip_stats.enabled)
+      {
+        clip = &s_clip_stats.voices[pb_addr];
+        ++clip->frames;
+        clip->format = pb.audio_addr.sample_format;
+        clip->src_type = pb.src_type;
+        clip->coef = pb.coef_select;
+        clip->ratio = HILO_TO_32(pb.src.ratio);
+        for (u32 i = 0; i < count; ++i)
+        {
+          const u32 a = static_cast<u32>(std::abs(static_cast<int>(samples[i])));
+          clip->max_abs_in = std::max(clip->max_abs_in, a);
+          clip->resample_clips += a >= 32767;
+        }
+        const VolumeData* mix[] = {&pb.mixer.main_left, &pb.mixer.main_right};
+        for (const VolumeData* m : mix)
+          clip->max_mix = std::max<u32>(clip->max_mix, m->volume);
+      }
       pb.src.cur_addr_frac = (curr_pos & 0xFFFF);
       pb.audio_addr.cur_addr_hi = static_cast<u16>(accelerator.GetCurrentAddress() >> 16);
       pb.audio_addr.cur_addr_lo = static_cast<u16>(accelerator.GetCurrentAddress());
@@ -690,6 +799,11 @@ void NativeAxWii::ProcessPBList(u32 pb_addr)
       {
         const s32 volume = (u16)pb.vol_env.cur_volume;
         const s32 sample = ((s32)samples[i] * volume) >> 15;
+        if (clip)
+        {
+          clip->max_volume = std::max<u32>(clip->max_volume, static_cast<u32>(volume));
+          clip->envelope_clips += sample > 0x7FFF || sample < -0x8000;
+        }
         samples[i] = ClampS16(sample);
         pb.vol_env.cur_volume += pb.vol_env.cur_volume_delta;
       }
@@ -751,11 +865,14 @@ void NativeAxWii::ProcessPBList(u32 pb_addr)
       }
     }
 
-    // WritePB (same layout, still without `updates`).
-    for (size_t i = 0; i < updates_begin / 2; ++i)
-      Write16(pb_addr + static_cast<u32>(i * 2), words[i]);
-    for (size_t i = updates_end / 2; i < sizeof(pb) / 2; ++i)
-      Write16(pb_addr + static_cast<u32>(i * 2 - sizeof(PBUpdatesWii)), words[i]);
+    // WritePB (same layout, still without `updates`). A block that was not
+    // running comes back unchanged: writing it would store the same words.
+    if (running)
+    {
+      WriteWords(pb_addr, words, updates_begin / 2);
+      WriteWords(pb_addr + static_cast<u32>(updates_begin), words + updates_end / 2,
+                 sizeof(pb) / 2 - updates_end / 2);
+    }
     pb_addr = HILO_TO_32(pb.next_pb);
   }
 }
@@ -897,6 +1014,11 @@ void NativeAxWii::OutputSamples(u32 lr_addr, u32 surround_addr, u16 volume, bool
     s64 right = m_samples_main_right[i];
     left = (left * volume_ramp[i]) >> 15;
     right = (right * volume_ramp[i]) >> 15;
+    if (s_clip_stats.enabled)
+    {
+      s_clip_stats.output_samples += 2;
+      s_clip_stats.output_clips += (left > 0x7FFF || left < -0x8000) + (right > 0x7FFF || right < -0x8000);
+    }
     m_samples_main_left[i] = ClampS16(left);
     m_samples_main_right[i] = ClampS16(right);
   }

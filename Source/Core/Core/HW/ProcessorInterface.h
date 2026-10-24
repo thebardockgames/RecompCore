@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <functional>
+
+
 #include "Common/CommonTypes.h"
 
 class PointerWrap;
@@ -79,6 +82,13 @@ public:
   u32 GetCause() const { return m_interrupt_cause; }
 
   void SetInterrupt(u32 cause_mask, bool set = true);
+  // RecompCore: the native interrupt controller takes every line while it is
+  // active (the hook returns true); phase S removes this object.
+  void SetNativeInterruptHook(std::function<bool(u32, bool)> hook)
+  {
+    m_native_interrupt_hook = std::move(hook);
+  }
+  u32 m_reset_code = 0;
 
   // Thread-safe func which sets and clears reset button state automagically
   void ResetButton_Tap();
@@ -107,7 +117,7 @@ private:
   CoreTiming::EventType* m_event_type_ios_notify_reset_button = nullptr;
   CoreTiming::EventType* m_event_type_ios_notify_power_button = nullptr;
 
-  u32 m_reset_code = 0;
+  std::function<bool(u32, bool)> m_native_interrupt_hook;
 
   Core::System& m_system;
 };

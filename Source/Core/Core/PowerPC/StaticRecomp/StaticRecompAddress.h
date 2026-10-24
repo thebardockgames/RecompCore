@@ -4,7 +4,7 @@
 #include <optional>
 #include <span>
 #include <algorithm>
-#include "Common/CommonTypes.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompTypes.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompABI.h"
 
 namespace StaticRecompAddress
@@ -35,9 +35,15 @@ void ForEachInvalidatedChunk(std::span<const StaticRecompRange> chunks, u32 addr
                              u32 length, u32 physical_address, u32 ram_size,
                              Callback callback)
 {
-  if (!length) return;
+  if (!length || chunks.empty()) return;
+  // The chunks are sorted: a range outside [first chunk, last chunk) touches
+  // none (the game's data-cache flushes are almost all on data, not code).
+  const u32 code_start = chunks.front().start;
+  const u32 code_end = chunks.back().end;
   const auto range = [&](u32 first, u64 size) {
     const u64 last = u64(first) + size - 1;
+    if (last < code_start || first >= code_end)
+      return;
     size_t lo = 0, hi = chunks.size();
     while (lo < hi)
     {

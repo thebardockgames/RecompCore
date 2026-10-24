@@ -3,11 +3,15 @@
 
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
-#include "Core/System.h"
 #include "Common/Logging/Log.h"
 
 #include <cstdlib>
 #include <cstdio>
+
+namespace Core
+{
+class System;
+}
 
 namespace StaticRecompLockstep
 {
@@ -55,7 +59,7 @@ void StaticRecompLockstepVerifier::Init()
     ERROR_LOG_FMT(POWERPC, "StaticRecomp: LOCKSTEP requested but no module loaded; ignored.");
     return;
   }
-  m_set_mem_journal = reinterpret_cast<SetMemJournalFn>(m_core.m_library.GetSymbolAddress("ppc_set_mem_write_journal"));
+  m_set_mem_journal = reinterpret_cast<SetMemJournalFn>(m_core.m_library.Symbol("ppc_set_mem_write_journal"));
   if (!m_set_mem_journal)
   {
     std::fprintf(stderr, "[lockstep] module lacks ppc_set_mem_write_journal export; "

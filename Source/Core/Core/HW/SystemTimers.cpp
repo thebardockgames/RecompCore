@@ -177,6 +177,11 @@ void SystemTimersManager::DecrementerSet()
   u32 decValue = ppc_state.spr[SPR_DEC];
 
   core_timing.RemoveEvent(m_event_type_decrementer);
+  if (m_native_dec_set)
+  {
+    m_native_dec_set();
+    return;
+  }
   if ((decValue & 0x80000000) == 0)
   {
     core_timing.SetFakeDecStartTicks(core_timing.GetTicks());
@@ -188,6 +193,8 @@ void SystemTimersManager::DecrementerSet()
 
 u32 SystemTimersManager::GetFakeDecrementer() const
 {
+  if (m_native_dec_get)
+    return m_native_dec_get();
   const auto& core_timing = m_system.GetCoreTiming();
   return (core_timing.GetFakeDecStartValue() -
           (u32)((core_timing.GetTicks() - core_timing.GetFakeDecStartTicks()) / TIMER_RATIO));

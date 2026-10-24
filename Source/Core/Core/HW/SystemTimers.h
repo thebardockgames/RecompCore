@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "Common/CommonTypes.h"
 
 namespace Core
@@ -75,6 +77,12 @@ public:
   // Notify timing system that somebody wrote to the decrementer
   void DecrementerSet();
   u32 GetFakeDecrementer() const;
+  // RecompCore: the native clock owns the decrementer while it exists.
+  void SetNativeDecrementer(std::function<void()> set, std::function<u32()> get)
+  {
+    m_native_dec_set = std::move(set);
+    m_native_dec_get = std::move(get);
+  }
 
   void TimeBaseSet();
   u64 GetFakeTimeBase() const;
@@ -88,6 +96,11 @@ public:
   // - 1.0: the emulator is running at 100% speed.
   // - 2.0: the emulator is running at 200% speed (or 100% speed but sleeping half of the time).
   double GetEstimatedEmulationPerformance() const;
+
+  // Phase D: the native video interface removes this event when it takes over.
+  CoreTiming::EventType* GetVIEventType() const { return m_event_type_vi; }
+  // RecompCore (phase S): the port retires these when it does not initialise their device.
+  CoreTiming::EventType* GetDSPEventType() const { return m_event_type_dsp; }
 
 private:
   static void DSPCallback(Core::System& system, u64 userdata, s64 cycles_late);
@@ -110,6 +123,8 @@ private:
   s64 m_localtime_rtc_offset = 0;
 
   CoreTiming::EventType* m_event_type_decrementer = nullptr;
+  std::function<void()> m_native_dec_set;
+  std::function<u32()> m_native_dec_get;
   CoreTiming::EventType* m_event_type_vi = nullptr;
   CoreTiming::EventType* m_event_type_audio_dma = nullptr;
   CoreTiming::EventType* m_event_type_dsp = nullptr;

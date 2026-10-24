@@ -20,7 +20,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "Common/CommonTypes.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompTypes.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompABI.h"
 
 namespace PowerPC

@@ -10,10 +10,13 @@
 // Origin[], Type[] ...) and the PC controller, the way N64Recomp ports replace
 // libultra's controller calls: a reset completes at once, with the type and
 // origin a GameCube controller reports (Dolphin's CSIDevice_GCController), and
-// the SI is never used. State stays in guest memory, so savestates need nothing
+// the SI is never used. The PC controller comes through HostGamePad
+// (StaticRecompHostInput.h), registered by the runtime; Dolphin's GCPad and
+// InputCommon are not involved. State stays in guest memory, so savestates need nothing
 // extra. A reset chain the original left running (a savestate taken mid-chain)
 // is left to finish on the SI.
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdio>
@@ -24,55 +27,25 @@
 #include <memory>
 #include <string>
 
-#include "Core/HW/GCPad.h"
-#include "Core/HW/SI/SI.h"
-#include "Core/HW/SI/SI_Device.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompHostInput.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeClock.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativePad.h"
-#include "Core/System.h"
-#include "InputCommon/GCPadStatus.h"
+
+namespace Core
+{
+class System;
+}
 
 namespace StaticRecompNativeSdk
 {
 namespace
 {
-constexpr u32 kSda = 0x806370A0;  // r13
-constexpr u32 kPadReset = 0x8021F748;
-constexpr u32 kPadRecalibrate = 0x8021F850;
-constexpr u32 kPadControlMotor = 0x8021FD98;
-constexpr u32 kSpec2MakeStatus = 0x80220080;
-// pad.a variables (small data, r13-relative).
-constexpr u32 kPendingBits = kSda - 0x6340;
-constexpr u32 kCheckingBits = kSda - 0x633C;
-constexpr u32 kWaitingBits = kSda - 0x6338;
-constexpr u32 kRecalibrateBits = kSda - 0x6334;
-constexpr u32 kResettingBits = kSda - 0x6330;
-constexpr u32 kEnabledBits = kSda - 0x632C;
-constexpr u32 kBarrelBits = kSda - 0x6344;
-constexpr u32 kResettingChan = kSda - 0x7E64;
-constexpr u32 kXPatchBits = kSda - 0x7E60;
-constexpr u32 kAnalogMode = kSda - 0x7E5C;
-constexpr u32 kSpec = kSda - 0x7E58;
-constexpr u32 kMakeStatus = kSda - 0x7E54;
-constexpr u32 kSiIdleCount = kSda - 25488;  // cleared by __VIResetSIIdle
-constexpr u32 kOrigin = 0x805658D0;         // PADStatus Origin[4]
-constexpr u32 kPadType = 0x80565900;        // u32 Type[4]
-constexpr u32 kPadPrevious = 0x80565920;    // PADStatus previous[4]
-constexpr u32 kSiPacketChan = 0x805807D0;   // Packet[chan].chan, stride 32 (-1: idle)
-constexpr u32 kSiChan = 0x80391170;         // Si.chan (channel transferring)
+#include "native/pad.inc"  // the game's addresses and fingerprints
 constexpr u32 kSramFlags = 0x800030E3;      // OSSram flags: 0x20 no rumble, 0x40 no recalibration
 constexpr u32 kGcControllerType = 0x09000000;  // SI type of a standard controller
 constexpr u32 kTypeNoMotor = 0x20000000;
 constexpr s64 kPadCycles = 400;
 
-constexpr std::array<CodeFingerprint, 7> kPadCode = {{
-    {0x8021FAB8u, 736u, 0xE29BD7CAD6F7242Dull},   // PADRead
-    {0x80220080u, 1408u, 0x738BBC6D95C958DDull},  // SPEC2_MakeStatus
-    {0x8021F748u, 264u, 0x9E5A58037AF9B199ull},   // PADReset
-    {0x8021F850u, 268u, 0xF47143C696A61BB3ull},   // PADRecalibrate
-    {0x8021FD98u, 184u, 0x095B18C16C1E4946ull},   // PADControlMotor
-    {0x8021EEECu, 2140u, 0x72AEB5F0F65A0727ull},  // UpdateOrigin and the reset chain callbacks
-    {0x8021CC18u, 16u, 0xEDA382FD2139495Bull},    // __VIResetSIIdle
-}};
 
 u32 Load32(const u8* p)
 {
@@ -112,9 +85,8 @@ bool NativeSdk::PadBind(const std::function<bool(u32)>& enable, bool wanted)
 
 bool NativeSdk::HostPadConnected(int chan)
 {
-  return m_system.GetSerialInterface().GetDeviceType(chan) ==
-             SerialInterface::SIDEVICE_GC_CONTROLLER &&
-         Pad::GetStatus(chan).isConnected;
+  HostGamePad* host = GetHostGamePad();
+  return host != nullptr && host->Poll(chan).connected;
 }
 
 bool NativeSdk::PadReady(const CPUState& guest)
@@ -195,10 +167,10 @@ void NativeSdk::PadReadOrigin(const CPUState& guest, u32 chan)
     return;
   const u8 response[10] = {0,
                            0,
-                           GCPadStatus::MAIN_STICK_CENTER_X,
-                           GCPadStatus::MAIN_STICK_CENTER_Y,
-                           GCPadStatus::C_STICK_CENTER_X,
-                           GCPadStatus::C_STICK_CENTER_Y,
+                           kHostPadStickCenter,
+                           kHostPadStickCenter,
+                           kHostPadStickCenter,
+                           kHostPadStickCenter,
                            0,
                            0,
                            0,
@@ -407,7 +379,8 @@ bool NativeSdk::PadRun(CPUState& guest)
       if (pad.rumble[chan] != strength)
       {
         pad.rumble[chan] = strength;
-        Pad::Rumble(static_cast<int>(chan), static_cast<ControlState>(strength));
+        if (HostGamePad* host = GetHostGamePad())
+          host->Rumble(static_cast<int>(chan), strength != 0);
       }
     }
     ++pad.motors;
@@ -442,5 +415,90 @@ void NativeSdk::PrintPadStats() const
                static_cast<unsigned long long>(pad.origin_requests),
                static_cast<unsigned long long>(pad.chained),
                static_cast<unsigned long long>(pad.deferred));
+  if (m_si_init_probes || m_si_register_accesses)
+  {
+    std::fprintf(stderr, "[native_pad] SI: init probes completed natively=%llu register accesses=%llu\n",
+                 static_cast<unsigned long long>(m_si_init_probes),
+                 static_cast<unsigned long long>(m_si_register_accesses));
+  }
+}
+
+// ---- the serial interface at boot (phase D closure) ----
+//
+// SIInit (0x802460FC) registers the SI interrupt handler, waits for the SI
+// command register to idle, and probes the four channels with SIGetType, whose
+// transfers the emulated SI answered with the controller type (0x09000000 for
+// a GameCube controller, SI_ERROR_NO_RESPONSE for an empty port) through
+// GetTypeCallback. With the native PAD library nobody else uses the SI, so the
+// probes complete in the act with the PC controller's state and the SI
+// registers are plain storage that always reads idle.
+
+namespace
+{
+constexpr u32 kSiTypeGcController = 0x09000000;
+constexpr u32 kSiErrorNoResponse = 0x00000008;
+constexpr u32 kSiErrorBusy = 0x00000080;
+constexpr u32 kSiRegisterBase = 0xCD006400;
+}  // namespace
+
+bool NativeSdk::SiInitGetType(CPUState& guest)
+{
+  if (std::find(kSiInitReturns.begin(), kSiInitReturns.end(), guest.lr) == kSiInitReturns.end())
+    return false;  // a real SIGetType from somewhere else: the original runs
+  if (!m_si_code_checked)
+  {
+    m_si_code_checked = true;
+    if (!CodeMatches(guest, kSiCode))
+    {
+      std::fprintf(stderr, "[native_pad] si.a differs from the original: SIInit left to it\n");
+      m_si_get_type = false;
+      return false;
+    }
+  }
+  const u32 chan = guest.gpr[3];
+  if (chan > 3)
+    return false;
+  // What GetTypeCallback leaves after the probe: the type and its time.
+  const u32 type = HostPadConnected(static_cast<int>(chan)) ? kSiTypeGcController : kSiErrorNoResponse;
+  const u64 now = StaticRecompNativeClock::NativeClock::CurrentTimeBase();
+  u8* type_ptr = Pointer(guest, kSiType + 4 * chan, 4);
+  u8* time_ptr = Pointer(guest, kSiTypeTime + 8 * chan, 8);
+  if (!type_ptr || !time_ptr)
+    return false;
+  Store32(type_ptr, type);
+  Store32(time_ptr, static_cast<u32>(now >> 32));
+  Store32(time_ptr + 4, static_cast<u32>(now));
+  ++m_si_init_probes;
+  // The original returned the previous type (busy, on the first probe).
+  guest.gpr[3] = kSiErrorBusy;
+  guest.pc = guest.lr;
+  guest.downcount -= 120;
+  return true;
+}
+
+bool NativeSdk::SiRegisterRead(u32 ea, u8 size, u64* value)
+{
+  if (!m_pad || (ea & 0xFFFFFF00u) != kSiRegisterBase || size != 4 || (ea & 3))
+    return false;
+  ++m_si_register_accesses;
+  // Command register (0x34): the transfer-start bit never stays set, nothing
+  // transfers. Everything else reads back what the SDK wrote.
+  u32 word = m_si_regs[(ea & 0xFF) / 4];
+  if ((ea & 0xFF) == 0x34)
+    word &= ~1u;
+  *value = word;
+  return true;
+}
+
+bool NativeSdk::SiRegisterWrite(u32 ea, u8 size, u64 value)
+{
+  if (!m_pad || (ea & 0xFFFFFF00u) != kSiRegisterBase || size != 4 || (ea & 3))
+    return false;
+  ++m_si_register_accesses;
+  u32 word = static_cast<u32>(value);
+  if ((ea & 0xFF) == 0x34)
+    word &= ~0x80000001u;  // interrupt acknowledge and transfer start are not state
+  m_si_regs[(ea & 0xFF) / 4] = word;
+  return true;
 }
 }  // namespace StaticRecompNativeSdk

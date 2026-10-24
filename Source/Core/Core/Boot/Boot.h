@@ -158,8 +158,13 @@ class CBoot
 public:
   static bool BootUp(Core::System& system, const Core::CPUThreadGuard& guard,
                      std::unique_ptr<BootParameters> boot);
+  // RecompCore: a native boot replaces the emulated BS2, IOS launch and
+  // apploader while the chassis exists (phase G). Cleared with nullptr.
+  using NativeBoot = std::function<bool(Core::System&, const Core::CPUThreadGuard&)>;
+  static void SetNativeBoot(NativeBoot boot) { s_native_boot = std::move(boot); }
 
 private:
+  static NativeBoot s_native_boot;
   static bool DVDRead(Core::System& system, const DiscIO::VolumeDisc& disc, u64 dvd_offset,
                       u32 output_address, u32 length, const DiscIO::Partition& partition);
   static bool DVDReadDiscID(Core::System& system, const DiscIO::VolumeDisc& disc,

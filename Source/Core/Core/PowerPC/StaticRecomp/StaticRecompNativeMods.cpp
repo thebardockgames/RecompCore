@@ -46,37 +46,14 @@ namespace
 {
 std::string s_mods_root;
 
-constexpr u32 kSda = 0x806370A0;
-constexpr u32 kFstPointer = 0x80000038;
-const char* const kMusicArchive = "wzs3us2.afs";
-constexpr u32 kDynamicSlot = 65003;     // zs3_29_US.adx
-constexpr u32 kSongFileBase = 0x10CA6;  // Bgm_Play id of zs3_00 (BGM Test: id + base)
-constexpr u32 kDynamicSlotId = kSongFileBase + 29;
-// New song ids: the reserved slots 20..23, then 26..55 (24 is "Random", 25
-// the locked "???"); names of ids >= 32 come from row id - 24 of sheet 3.
-bool IsNewSongId(u32 id)
-{
-  return (id >= 20 && id < 24) || (id >= 26 && id < 56);
-}
-// Game functions hooked for mods (tools/native-sdk/RDSE70-native-hooks.txt).
-constexpr u32 kClipSetUv = 0x80023228;
-constexpr u32 kBgmPlay = 0x80028000;
-constexpr u32 kBgmListApplyUnlocks = 0x8002A8F4;
-// Draw functions that show song names (uv sheet id / 8, row id % 8): the
-// BGM Test and the music selectors of the stage selects.
+// A range of guest code (the game layer lists the draw functions that show
+// song names).
 struct CodeRange
 {
   u32 begin, end;
 };
-constexpr CodeRange kSongNameDraws[] = {
-    {0x800ED280, 0x800EF308},  // Option_Draw (BGM Test)
-    {0x8006F18C, 0x8006FDF8},  // character/stage select ("mc_bgm_now")
-    {0x800B1C68, 0x800B2E9C},  // stage select ("mc_bgm_now")
-    {0x801E4BA8, 0x801E5790},  // stage select ("mc_bgm_now")
-};
-constexpr u32 kProgress = kSda - 0x6D30;  // gProgress pointer (mode at +0x18)
-constexpr u32 kSaveData = kSda - 0x6C40;  // gSaveData pointer (bgmBits at +0xC30)
-constexpr u32 kHighNameSheet = 3;
+#include "native/mods.inc"  // the game's addresses, song ids and archives
+constexpr u32 kFstPointer = 0x80000038;
 
 u32 LoadBe32(const u8* p)
 {

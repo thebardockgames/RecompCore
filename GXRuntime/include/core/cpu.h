@@ -27,7 +27,7 @@
 //   consumes and resets it (Dolphin chassis: per-dispatch flush into
 //   ppc_state.downcount). Hosts that do not meter guest time may ignore it
 //   (s64: it cannot wrap in any realistic session).
-#define GXRUNTIME_CPU_ABI_VERSION 4u
+#define GXRUNTIME_CPU_ABI_VERSION 5u
 #define GXRUNTIME_CPU_ABI_DOLRECOMP_PREFIX 1u
 #define GXRUNTIME_CPU_ABI_EXTERNAL_POINTER_EXTENSION 1u
 
@@ -148,6 +148,13 @@ struct CPUState {
     // the module chunk table; native direct calls check it before entering
     // another chunk. NULL disables direct calls. The ABI v3 prefix is intact.
     const u8* chunk_state;
+    // ABI v5 appends the GP write-gather pipe's current 32-byte burst, owned
+    // by the runtime: stores to the gather pipe (0xCC008000) are appended to
+    // it here while they leave room in the burst; the store that completes a
+    // burst, and every store while gather_buffer is NULL, still goes through
+    // external_write. The ABI v4 prefix is intact.
+    u8* gather_buffer;
+    u32 gather_count;
 };
 
 #include <stdio.h>
@@ -178,6 +185,18 @@ static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size
     return NULL;
 }
 
+// ABI v5: a gather-pipe store that leaves room in the current burst, appended
+// big-endian in store order (the runtime flushes full bursts).
+static GXRUNTIME_ALWAYS_INLINE bool gather_append(CPUState* cpu, u32 addr, u64 value, u32 size) {
+    if ((addr & 0xFFFFF000u) != 0xCC008000u || cpu->gather_buffer == NULL || cpu->gather_count + size >= 32u)
+        return false;
+    u8* out = cpu->gather_buffer + cpu->gather_count;
+    for (u32 i = 0; i < size; ++i)
+        out[i] = (u8)(value >> (8u * (size - 1u - i)));
+    cpu->gather_count += size;
+    return true;
+}
+
 static GXRUNTIME_ALWAYS_INLINE u64 mem_read64(CPUState* cpu, u32 addr) {
     u8* ptr = get_ram_ptr(cpu, addr, 8, NULL);
     if (ptr == NULL) {
@@ -192,6 +211,8 @@ static GXRUNTIME_ALWAYS_INLINE void mem_write64(CPUState* cpu, u32 addr, u64 val
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 8, &offset);
     if (ptr == NULL) {
+        if (gather_append(cpu, addr, value, 8))
+            return;
         if (cpu->external_write) {
             cpu->external_write(cpu, addr, value, 8);
         }
@@ -215,6 +236,8 @@ static GXRUNTIME_ALWAYS_INLINE void mem_write32(CPUState* cpu, u32 addr, u32 val
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 4, &offset);
     if (ptr == NULL) {
+        if (gather_append(cpu, addr, value, 4))
+            return;
         if (cpu->external_write) {
             cpu->external_write(cpu, addr, value, 4);
         }
@@ -238,6 +261,8 @@ static GXRUNTIME_ALWAYS_INLINE void mem_write16(CPUState* cpu, u32 addr, u16 val
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 2, &offset);
     if (ptr == NULL) {
+        if (gather_append(cpu, addr, value, 2))
+            return;
         if (cpu->external_write) {
             cpu->external_write(cpu, addr, value, 2);
         }
@@ -261,6 +286,8 @@ static GXRUNTIME_ALWAYS_INLINE void mem_write8(CPUState* cpu, u32 addr, u8 value
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 1, &offset);
     if (ptr == NULL) {
+        if (gather_append(cpu, addr, value, 1))
+            return;
         if (cpu->external_write) {
             cpu->external_write(cpu, addr, value, 1);
         }
@@ -365,44 +392,85 @@ static GXRUNTIME_ALWAYS_INLINE u8* psq_direct(CPUState* cpu, u32 ea, u32 bytes) 
     return (u8*)cpu->external_pointer(cpu, ea, bytes);
 }
 
-static GXRUNTIME_ALWAYS_INLINE bool ppc_psq_load_inline(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr_index,
-                                                        bool indexed, u32 cia) {
+// The quantized load/store with the paired-single lanes as values: generated
+// code that keeps guest registers in locals (DolRecomp register cache) passes
+// them directly. On an exception nothing is written.
+static GXRUNTIME_ALWAYS_INLINE bool ppc_psq_load_to(CPUState* cpu, f64* ps0, f64* ps1, u32 ea, bool w,
+                                                    u8 gqr_index, bool indexed, u32 cia) {
     if (!indexed && (cpu->hid2 & PPC_HID2_LSQE) == 0) {
         ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
         return false;
     }
     const u32 gqr = cpu->gqr[gqr_index & 7u];
+    if (((gqr >> 16) & 7u) == 0) {
+        /* Fast path, same result: single-precision lanes (the scale does not
+           apply to floats) straight from RAM; anything else takes the
+           general path below. */
+        const u8* ram = get_ram_ptr(cpu, ea, w ? 4u : 8u, NULL);
+        if (ram) {
+            *ps0 = f64_value(convert_to_double(read_be32(ram)));
+            *ps1 = w ? 1.0 : f64_value(convert_to_double(read_be32(ram + 4)));
+            return true;
+        }
+    }
     const s32 scale = sign_extend((gqr >> 24) & 0x3Fu, 6);
     const u8 type = (u8)((gqr >> 16) & 7u);
     const u32 size = psq_type_size(type);
     if (size == 0) { /* invalid GQR type: both lanes read as 0.0 */
-        cpu->fpr[frD] = 0.0;
-        cpu->ps1[frD] = 0.0;
+        *ps0 = 0.0;
+        *ps1 = 0.0;
         return true;
     }
     const u8* direct = psq_direct(cpu, ea, w ? size : size * 2);
-    cpu->fpr[frD] = psq_from_raw(psq_read_raw(cpu, direct, ea, size), type, scale);
-    cpu->ps1[frD] = w ? 1.0 : psq_from_raw(psq_read_raw(cpu, direct ? direct + size : NULL, ea + size, size), type, scale);
+    *ps0 = psq_from_raw(psq_read_raw(cpu, direct, ea, size), type, scale);
+    *ps1 = w ? 1.0 : psq_from_raw(psq_read_raw(cpu, direct ? direct + size : NULL, ea + size, size), type, scale);
     return true;
 }
 
-static GXRUNTIME_ALWAYS_INLINE bool ppc_psq_store_inline(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index,
-                                                         bool indexed, u32 cia) {
+static GXRUNTIME_ALWAYS_INLINE bool ppc_psq_store_from(CPUState* cpu, f64 ps0, f64 ps1, u32 ea, bool w,
+                                                       u8 gqr_index, bool indexed, u32 cia) {
     if (!indexed && (cpu->hid2 & PPC_HID2_LSQE) == 0) {
         ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
         return false;
     }
     const u32 gqr = cpu->gqr[gqr_index & 7u];
+    if ((gqr & 7u) == 0) {
+        /* Fast path, same result: single-precision lanes straight to RAM. */
+        u32 offset;
+        u8* ram = get_ram_ptr(cpu, ea, w ? 4u : 8u, &offset);
+        if (ram) {
+            /* As two mem_write32 calls: journal and write lane by lane. */
+            if (g_mem_write_journal && offset != (u32)-1)
+                g_mem_write_journal(offset, 4, g_mem_write_journal_user);
+            write_be32(ram, convert_to_single_ftz(f64_bits(ps0)));
+            if (!w) {
+                if (g_mem_write_journal && offset != (u32)-1)
+                    g_mem_write_journal(offset + 4, 4, g_mem_write_journal_user);
+                write_be32(ram + 4, convert_to_single_ftz(f64_bits(ps1)));
+            }
+            return true;
+        }
+    }
     const s32 scale = sign_extend((gqr >> 8) & 0x3Fu, 6);
     const u8 type = (u8)(gqr & 7u);
     const u32 size = psq_type_size(type);
     if (size == 0) /* invalid GQR type: nothing is stored */
         return true;
     u8* direct = psq_direct(cpu, ea, w ? size : size * 2);
-    psq_write_raw(cpu, direct, ea, size, psq_to_raw(cpu->fpr[frS], type, scale));
+    psq_write_raw(cpu, direct, ea, size, psq_to_raw(ps0, type, scale));
     if (!w)
-        psq_write_raw(cpu, direct ? direct + size : NULL, ea + size, size, psq_to_raw(cpu->ps1[frS], type, scale));
+        psq_write_raw(cpu, direct ? direct + size : NULL, ea + size, size, psq_to_raw(ps1, type, scale));
     return true;
+}
+
+static GXRUNTIME_ALWAYS_INLINE bool ppc_psq_load_inline(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr_index,
+                                                        bool indexed, u32 cia) {
+    return ppc_psq_load_to(cpu, &cpu->fpr[frD], &cpu->ps1[frD], ea, w, gqr_index, indexed, cia);
+}
+
+static GXRUNTIME_ALWAYS_INLINE bool ppc_psq_store_inline(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index,
+                                                         bool indexed, u32 cia) {
+    return ppc_psq_store_from(cpu, cpu->fpr[frS], cpu->ps1[frS], ea, w, gqr_index, indexed, cia);
 }
 
 #undef GXRUNTIME_ALWAYS_INLINE

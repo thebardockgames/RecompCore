@@ -1,7 +1,9 @@
 // RecompCore: StaticRecomp CPU core - Memory and instruction fallback HLE hooks.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "Core/PowerPC/StaticRecomp/StaticRecompKernelChassis.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeExi.h"
 #include "Core/System.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -11,7 +13,10 @@
 #include "Core/PowerPC/StaticRecomp/StaticRecompKernel.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompNativeSdk.h"
 #include "Core/HW/GPFifo.h"
-#include "Core/HW/Memmap.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeGp.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeVi.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativePi.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompGuestRam.h"
 #include "Common/Logging/Log.h"
 #include "Common/ScopeGuard.h"
 #include "Core/HW/CPU.h"
@@ -28,7 +33,7 @@ bool StaticRecompCore::HookMenuExtension(CPUState* cpu,u32 event)
     auto* core=static_cast<StaticRecompCore*>(cpu->external_user_data);
     const u32 previous=cpu->pc;
     cpu->pc=event==0xffff0040u?0x8019E6F0u:0x8019EB2Cu;
-    const bool skipped=core->m_native_sdk&&core->m_native_sdk->SkipBootNotice(*cpu);
+    const bool skipped=core->m_machine.sdk&&core->m_machine.sdk->SkipBootNotice(*cpu);
     if(!skipped)cpu->pc=previous;
     return skipped;
   }
@@ -45,14 +50,14 @@ std::optional<u32> StaticRecompCore::InvokeMenuFunction(CPUState& caller,u32 add
   if(!m_module||arguments.size()>8||!valid_stack)return {};
   CPUState invoke=caller;invoke.gpr[1]-=0x800;invoke.pc=address;invoke.lr=0xfffffffc;
   const Common::ScopeGuard restore_guest([this,&caller] {
-    if(m_native_sdk)m_native_sdk->RestoreCallbackGuest(caller);
+    if(m_machine.sdk)m_machine.sdk->RestoreCallbackGuest(caller);
   });
   invoke.downcount=0;invoke.dispatch_budget=0;invoke.exception=0;
   invoke.instruction_fallback=[](CPUState* state,u32,u32){state->exception=1;};
   for(size_t n=0;n<arguments.size();++n)invoke.gpr[3+n]=arguments[n];
   for(int step=0;step<50000&&invoke.pc!=0xfffffffc&&!invoke.exception;++step){
     if(!DispatchableAt(invoke.pc))return {};
-    if(!(m_native_sdk&&m_native_sdk->Run(invoke))&&!m_module->dispatch(&invoke,invoke.pc))return {};
+    if(!(m_machine.sdk&&m_machine.sdk->Run(invoke))&&!m_module->dispatch(&invoke,invoke.pc))return {};
   }
   if(m_module->on_state_loaded)m_module->on_state_loaded(&caller);
   if(invoke.pc!=0xfffffffc||invoke.exception)return {};
@@ -67,18 +72,43 @@ constexpr u32 LOCKED_CACHE_BASE = 0xE0000000u;
 // Diagnostics: MODERNGEKKO_NATIVE_EXTERNAL_STATS=1 counts the accesses that
 // leave generated code for the MMU (by 4 KiB page and pc) and prints the
 // busiest every 2^22 accesses.
+// MODERNGEKKO_NATIVE_EXTERNAL_STATS_FILE=<csv> keeps every (access, page, pc)
+// pair for the whole run and writes the complete table at exit.
 struct ExternalStats
 {
+  // "1" enables the periodic summary; any other non-empty value enables it and
+  // names the CSV that receives the complete table at exit.
   bool enabled = [] {
     const char* v = std::getenv("MODERNGEKKO_NATIVE_EXTERNAL_STATS");
-    return v != nullptr && v[0] == '1';
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  const char* file = [] {
+    const char* v = std::getenv("MODERNGEKKO_NATIVE_EXTERNAL_STATS");
+    return (v && v[0] != '\0' && !(v[0] == '1' && v[1] == '\0') && !(v[0] == '0' && v[1] == '\0')) ? v : nullptr;
   }();
   std::unordered_map<u64, u64> counts;  // (write << 63) | (page << 32) | pc
   u64 total = 0;
 
+  ~ExternalStats()
+  {
+    if (!enabled || !file)
+      return;
+    if (FILE* out = std::fopen(file, "w"))
+    {
+      std::fprintf(out, "access,address,pc,count\n");
+      for (const auto& [key, count] : counts)
+        std::fprintf(out, "%s,0x%08X,0x%08X,%llu\n", (key >> 63) ? "write" : "read",
+                     static_cast<u32>((key >> 32) & 0x7FFFFFFF) << 1, static_cast<u32>(key),
+                     static_cast<unsigned long long>(count));
+      std::fclose(out);
+    }
+  }
+
   void Count(bool write, u32 ea, u32 pc)
   {
-    ++counts[(u64(write) << 63) | (u64(ea >> 12) << 32) | pc];
+    // RAM by 4 KiB page, MMIO by exact (even) address: the key holds ea >> 1.
+    const u32 keyed = (ea >= 0xC0000000u ? ea : (ea & 0xFFFFF000u)) >> 1;
+    ++counts[(u64(write) << 63) | (u64(keyed) << 32) | pc];
     if ((++total & ((1u << 22) - 1)) != 0)
       return;
     std::vector<std::pair<u64, u64>> top(counts.begin(), counts.end());
@@ -86,11 +116,12 @@ struct ExternalStats
                       [](const auto& a, const auto& b) { return a.second > b.second; });
     std::fprintf(stderr, "[external_stats] total=%llu\n", static_cast<unsigned long long>(total));
     for (std::size_t i = 0; i < std::min<std::size_t>(12, top.size()); ++i)
-      std::fprintf(stderr, "[external_stats] %s page=0x%05X000 pc=0x%08X count=%llu\n",
-                   (top[i].first >> 63) ? "write" : "read", static_cast<u32>((top[i].first >> 32) & 0x7FFFFFFF),
+      std::fprintf(stderr, "[external_stats] %s address=0x%08X pc=0x%08X count=%llu\n",
+                   (top[i].first >> 63) ? "write" : "read", static_cast<u32>((top[i].first >> 32) & 0x7FFFFFFF) << 1,
                    static_cast<u32>(top[i].first), static_cast<unsigned long long>(top[i].second));
     std::fflush(stderr);
-    counts.clear();
+    if (!file)
+      counts.clear();
   }
 };
 ExternalStats s_external_stats;
@@ -100,12 +131,32 @@ ExternalStats s_external_stats;
 // the hardware dispatch around it. The THP movie decoder stores there millions
 // of times per second; through the MMU the intro movie ran at 63 % speed.
 // Same address assumption as HookExternalPointer (games use 0xE0000000).
-u8* LockedCache(Memory::MemoryManager& memory, u32 ea, u32 size)
+// Phase S: a real-mode access (MSR.DR = 0: the exception vectors and the OS
+// handlers they enter) to MEM1/MEM2 by physical address. The module's inline
+// path only knows the mapped aliases, so these reached the chassis MMU
+// (~800 000 per 50 s of combat, all RAM); served from the module's pointers.
+u8* PhysicalRam(const CPUState& cpu, u32 ea, u32 size)
 {
-  const u32 offset = ea - LOCKED_CACHE_BASE;
-  if (ea < LOCKED_CACHE_BASE || !memory.GetL1Cache() || offset + size > memory.GetL1CacheSize())
+  if ((cpu.msr & 0x10u) != 0)
     return nullptr;
-  return memory.GetL1Cache() + offset;
+  if (cpu.ram && ea < cpu.ram_size && u64(ea) + size <= cpu.ram_size)
+    return cpu.ram + ea;
+  if (cpu.exram && (ea >> 28) == 0x1)
+  {
+    const u32 offset = ea & 0x0FFFFFFFu;
+    if (offset < cpu.exram_size && u64(offset) + size <= cpu.exram_size)
+      return cpu.exram + offset;
+  }
+  return nullptr;
+}
+
+u8* LockedCache(u32 ea, u32 size)
+{
+  const auto& guest_ram = StaticRecompGuestRam::GuestRam::Instance();
+  const u32 offset = ea - LOCKED_CACHE_BASE;
+  if (ea < LOCKED_CACHE_BASE || !guest_ram.L1() || offset + size > guest_ram.L1Size())
+    return nullptr;
+  return guest_ram.L1() + offset;
 }
 }
 
@@ -116,12 +167,11 @@ void StaticRecompCore::RefreshDispatchBudget(CPUState& cpu)
     cpu.dispatch_budget = 0;
     return;
   }
-  const auto& ppc = m_system.GetPPCState();
   constexpr u32 synchronous = ~static_cast<u32>(
       EXCEPTION_EXTERNAL_INT | EXCEPTION_DECREMENTER | EXCEPTION_PERFORMANCE_MONITOR);
-  cpu.dispatch_budget = (ppc.Exceptions & synchronous) ||
+  cpu.dispatch_budget = (m_regs.exceptions & synchronous) ||
       m_lockstep_verifier->m_ls_journaling ||
-      m_system.GetCPU().GetState() != CPU::State::Running ? 0 : std::max(0, ppc.downcount);
+      m_system.GetCPU().GetState() != CPU::State::Running ? 0 : std::max(0, m_regs.downcount);
 }
 
 u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
@@ -129,15 +179,30 @@ u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   if (!core->m_lockstep_verifier->m_ls_journaling)
   {
-    if (const u8* cache = LockedCache(core->m_system.GetMemory(), ea, size))
+    if (const u8* cache = LockedCache(ea, size))
     {
       u64 value = 0;
       for (u8 i = 0; i < size; ++i)
         value = (value << 8) | cache[i];
       return value;
     }
+    if (const u8* ram = PhysicalRam(*cpu, ea, size))
+    {
+      ++core->m_native_physical_accesses;
+      u64 value = 0;
+      for (u8 i = 0; i < size; ++i)
+        value = (value << 8) | ram[i];
+      return value;
+    }
   }
   const Common::ScopeGuard budget([&] { core->RefreshDispatchBudget(*cpu); });
+  // The port's devices (phase L1: the machine's register dispatch).
+  if (!core->m_lockstep_verifier->m_ls_journaling)
+  {
+    u64 native_value = 0;
+    if (core->m_machine.Read(ea, size, &native_value))
+      return native_value;
+  }
   core->PropagateGuestMSR();
   auto& mmu = core->m_system.GetMMU();
   if (s_external_stats.enabled)
@@ -161,6 +226,7 @@ u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
     ERROR_LOG_FMT(POWERPC, "StaticRecomp: external read of bad size {} at 0x{:08X}", size, ea);
     return 0;
   }
+  core->FoldChassisExceptions();  // a DSI the chassis's MMU raised on its mirror
   if (core->m_lockstep_verifier->m_ls_journaling &&
       StaticRecompLockstep::LsHwAccessInScope(mmu, ea))
   {
@@ -174,15 +240,25 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   if (!core->m_lockstep_verifier->m_ls_journaling)
   {
-    if (u8* cache = LockedCache(core->m_system.GetMemory(), ea, size))
+    if (u8* cache = LockedCache(ea, size))
     {
       for (u8 i = 0; i < size; ++i)
         cache[i] = static_cast<u8>(value >> (8 * (size - 1 - i)));
       return;
     }
+    if (u8* ram = PhysicalRam(*cpu, ea, size))
+    {
+      ++core->m_native_physical_accesses;
+      for (u8 i = 0; i < size; ++i)
+        ram[i] = static_cast<u8>(value >> (8 * (size - 1 - i)));
+      return;
+    }
   }
   const Common::ScopeGuard budget([&] { core->RefreshDispatchBudget(*cpu); });
 
+  // The port's devices (phase L1: the machine's register dispatch).
+  if (!core->m_lockstep_verifier->m_ls_journaling && core->m_machine.Write(ea, size, value))
+    return;
   // Gather-pipe fast path: stores to the write-gather pipe page at effective
   // 0xCC008000 go straight to GPFifo, mirroring the MMU's masked-write
   // special case without an MMU round trip. Keying on the effective page is
@@ -241,6 +317,7 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
     ERROR_LOG_FMT(POWERPC, "StaticRecomp: external write of bad size {} at 0x{:08X}", size, ea);
     break;
   }
+  core->FoldChassisExceptions();
 }
 
 u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
@@ -253,6 +330,7 @@ u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
   core->PropagateGuestMSR();
   auto& mmu = core->m_system.GetMMU();
   const u32 value = mmu.Read<u32>(ea);
+  core->FoldChassisExceptions();
   if (core->m_lockstep_verifier->m_ls_journaling &&
       StaticRecompLockstep::LsHwAccessInScope(mmu, ea))
   {
@@ -274,6 +352,7 @@ void StaticRecompCore::HookExternalWrite32(CPUState* cpu, u32 ea, u32 value, u8 
     core->m_lockstep_verifier->m_journal.native_mmio.push_back({ea, value, 4});
   }
   mmu.Write<u32>(value, ea);
+  core->FoldChassisExceptions();
 }
 
 void* StaticRecompCore::HookExternalPointer(CPUState* cpu, u32 ea, u32 size)
@@ -282,11 +361,11 @@ void* StaticRecompCore::HookExternalPointer(CPUState* cpu, u32 ea, u32 size)
   // Lockstep journals locked-cache stores through the MMU: no direct access.
   if (core->m_lockstep_verifier->m_ls_journaling)
     return nullptr;
-  auto& memory = core->m_system.GetMemory();
+  const auto& guest_ram = StaticRecompGuestRam::GuestRam::Instance();
   if (ea >= LOCKED_CACHE_BASE && size != 0 &&
-      (ea - LOCKED_CACHE_BASE) + size <= memory.GetL1CacheSize())
+      (ea - LOCKED_CACHE_BASE) + size <= guest_ram.L1Size())
   {
-    return memory.GetL1Cache() + (ea - LOCKED_CACHE_BASE);
+    return guest_ram.L1() + (ea - LOCKED_CACHE_BASE);
   }
   // Everything else stays on the per-access MMU hooks: this hook receives
   // *effective* addresses, and whether one maps to RAM depends on live
@@ -311,46 +390,47 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
   auto& ppc = system.GetPPCState();
 
   core->PropagateGuestMSR();
-  if (StaticRecompKernel::TryRunDmaRegister(system, *cpu, raw, cia))
+  const StaticRecompGuestRegs::RegsView regs = core->m_regs.View();
+  const StaticRecompKernel::KernelHost& kernel = StaticRecompKernelChassis::Host(system);
+  if (StaticRecompKernel::TryRunDmaRegister(kernel, *cpu, regs, raw, cia))
   {
     ++core->m_native_dma_register_instructions;
     return;
   }
-  if (StaticRecompKernel::TryRunDecrementerWrite(system, *cpu, raw, cia))
+  if (StaticRecompKernel::TryRunDecrementerWrite(kernel, *cpu, regs, raw, cia))
   {
     ++core->m_native_decrementer_writes;
     return;
   }
-  if (StaticRecompKernel::TryRunDecrementerRead(system, *cpu, raw, cia))
+  if (StaticRecompKernel::TryRunDecrementerRead(kernel, *cpu, regs, raw, cia))
   {
     ++core->m_native_decrementer_reads;
     return;
   }
-  if (const u32 count = StaticRecompKernel::TryRunCacheOperation(system, *cpu, raw, cia))
+  if (const u32 count = StaticRecompKernel::TryRunCacheOperation(kernel, *cpu, regs, raw, cia))
   {
     core->m_native_cache_instructions += count;
     ++core->m_native_cache_batches;
     return;
   }
 
-  if (StaticRecompKernel::TryRunGatherPipeRegister(system, *cpu, raw, cia))
+  if (StaticRecompKernel::TryRunGatherPipeRegister(kernel, *cpu, regs, raw, cia))
   {
     ++core->m_native_gather_register_instructions;
     return;
   }
 
-  if (StaticRecompKernel::TryRunScratchRegister(system, *cpu, raw, cia))
+  if (StaticRecompKernel::TryRunScratchRegister(kernel, *cpu, regs, raw, cia))
   {
     ++core->m_native_scratch_register_instructions;
     return;
   }
-  core->SyncOut();
-  if (StaticRecompKernel::TryRunSystemRegister(system, raw, cia))
+  if (StaticRecompKernel::TryRunSystemRegister(kernel, *cpu, regs, raw, cia))
   {
     ++core->m_native_system_register_instructions;
-    core->SyncIn();
     return;
   }
+  core->EnterChassis();
   ++core->m_hook_fallback_instructions;
   if (!core->m_native_pc_profile_path.empty())
     ++core->m_native_hook_samples[cia];
@@ -360,5 +440,5 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
   ppc.pc = cia;
   ppc.npc = cia + 4;
   ppc.downcount -= system.GetInterpreter().SingleStepInner();
-  core->SyncIn();
+  core->EnterGuest();
 }

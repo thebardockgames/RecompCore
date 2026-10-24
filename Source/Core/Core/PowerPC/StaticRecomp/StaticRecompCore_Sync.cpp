@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompExceptions.h"
 #include "Core/System.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/HW/SystemTimers.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeClock.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativePi.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +70,12 @@ void StaticRecompCore::SyncIn()
     m_guest.sr[i] = ppc.sr[i];
   for (int i = 0; i < 8; ++i)
     m_guest.gqr[i] = ppc.spr[SPR_GQR0 + i];
+  std::memcpy(m_regs.spr, ppc.spr, sizeof(m_regs.spr));  // the supervisor registers
+  // The pending lines and the slice counter move too; the chassis's copy is
+  // left empty so anything it raises meanwhile is a delta (FoldChassisExceptions).
+  m_regs.exceptions = ppc.Exceptions;
+  ppc.Exceptions = 0;
+  m_regs.downcount = ppc.downcount;
   // Dolphin materializes TB lazily on read (spr[TL/TU] is a stale cache);
   // GetFakeTimeBase() is the live value, matching the interpreter's mftb.
   m_guest.timebase = m_system.GetSystemTimers().GetFakeTimeBase();
@@ -92,6 +101,10 @@ void StaticRecompCore::SyncOut()
   ppc.downcount += static_cast<int>(m_guest.downcount);
   m_guest.downcount = 0;
 
+  std::memcpy(ppc.spr, m_regs.spr, sizeof(m_regs.spr));  // then CPUState's own SPRs win
+  ppc.Exceptions |= m_regs.exceptions;
+  m_regs.exceptions = 0;
+  ppc.downcount = m_regs.downcount;
   SetPPCStateFromGuestState(m_guest, ppc);
   // Timebase is owned by Dolphin's CoreTiming; native code cannot write it.
 
@@ -115,6 +128,62 @@ void StaticRecompCore::SyncOut()
   }
   if (force_ftz)
     _mm_setcsr(_mm_getcsr() | 0x8040u);
+}
+
+void StaticRecompCore::EnterGuest()
+{
+  if (m_authority == StateAuthority::Chassis || m_sync_every_burst)
+  {
+    SyncIn();
+    ++m_sync_in;
+  }
+  else
+  {
+    // The guest state is already current: only the per-burst scratch fields.
+    m_guest.exception = 0;
+    m_guest.program_exception = 0;
+    m_guest.downcount = 0;
+    m_guest.dispatch_budget = 0;
+    m_guest.timebase = m_system.GetSystemTimers().GetFakeTimeBase();
+  }
+  m_authority = StateAuthority::Guest;
+  if (m_machine.clock)
+    m_machine.clock->SetCpuState(&m_guest, &m_regs);
+  if (m_machine.pi)
+    m_machine.pi->SetGuestRegs(&m_regs);
+}
+
+void StaticRecompCore::EnterChassis()
+{
+  if (m_authority == StateAuthority::Guest)
+  {
+    SyncOut();
+    ++m_sync_out;
+  }
+  m_authority = StateAuthority::Chassis;
+  if (m_machine.clock)
+    m_machine.clock->SetCpuState(nullptr, nullptr);
+  if (m_machine.pi)
+    m_machine.pi->SetGuestRegs(nullptr);
+}
+
+static_assert(StaticRecompExceptions::kDecrementer == EXCEPTION_DECREMENTER &&
+              StaticRecompExceptions::kSyscall == EXCEPTION_SYSCALL &&
+              StaticRecompExceptions::kExternalInt == EXCEPTION_EXTERNAL_INT &&
+              StaticRecompExceptions::kDsi == EXCEPTION_DSI && StaticRecompExceptions::kIsi == EXCEPTION_ISI &&
+              StaticRecompExceptions::kAlignment == EXCEPTION_ALIGNMENT &&
+              StaticRecompExceptions::kFpuUnavailable == EXCEPTION_FPU_UNAVAILABLE &&
+              StaticRecompExceptions::kProgram == EXCEPTION_PROGRAM &&
+              StaticRecompExceptions::kPerformanceMonitor == EXCEPTION_PERFORMANCE_MONITOR &&
+              StaticRecompExceptions::kFakeMemcheckHit == EXCEPTION_FAKE_MEMCHECK_HIT);
+
+bool StaticRecompCore::DeliverSynchronousException()
+{
+  // PowerPCManager::CheckExceptions on the module's state (StaticRecompExceptions).
+  if (!StaticRecompExceptions::DeliverSynchronous(m_guest, m_regs.exceptions))
+    return false;
+  ++m_native_sync_exceptions_delivered;
+  return true;
 }
 
 void StaticRecompCore::PropagateGuestMSR()

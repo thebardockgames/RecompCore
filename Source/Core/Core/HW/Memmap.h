@@ -104,6 +104,21 @@ public:
   void ShutdownFastmemArena();
   void DoState(PointerWrap& p);
 
+  // RecompCore (phase S): the runtime owns the guest memory and lends it here
+  // before Init(); the regions are then mapped onto these buffers instead of
+  // the arena (no fastmem arena in that mode: the JIT is not used).
+  struct ExternalBuffers
+  {
+    u8* ram = nullptr;
+    u32 ram_size = 0;  // allocated (power of two)
+    u8* l1 = nullptr;
+    u32 l1_size = 0;
+    u8* exram = nullptr;
+    u32 exram_size = 0;
+  };
+  void SetExternalBuffers(const ExternalBuffers& buffers) { m_external = buffers; }
+  bool UsingExternalBuffers() const { return m_using_external; }
+
   void UpdateDBATMappings(const PowerPC::BatTable& dbat_table);
   void AddPageTableMapping(u32 logical_address, u32 translated_address, bool writeable);
   void RemovePageTableMappings(const std::set<u32>& mappings);
@@ -224,6 +239,8 @@ private:
 
   // The MemArena class
   Common::MemArena m_arena;
+  ExternalBuffers m_external;
+  bool m_using_external = false;
 
   const u32 m_page_size;
   const u32 m_guest_pages_per_host_page;

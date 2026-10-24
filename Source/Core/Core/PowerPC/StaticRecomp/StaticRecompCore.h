@@ -12,12 +12,17 @@
 #include <span>
 #include <optional>
 
-#include "Common/CommonTypes.h"
-#include "Common/DynamicLibrary.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompCodeGuard.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompCpuHost.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompMachine.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompTypes.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompModuleLoader.h"
 #include "Core/PowerPC/JitCommon/JitBase.h"
 #include "Core/PowerPC/JitCommon/JitCache.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompABI.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompModuleSource.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompGuestRegs.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompNativeBat.h"
 
 namespace Core
 {
@@ -42,7 +47,32 @@ class NativeSdk;
 // Executes statically recompiled per-game native code when the PC is covered by
 // a loaded module; falls back to Dolphin's interpreter for everything else.
 // With no module loaded this core is exactly an interpreter loop.
-class StaticRecompCore : public JitBase
+namespace StaticRecompNativeGp
+{
+class NativeGp;
+}
+namespace StaticRecompNativeVi
+{
+class NativeVi;
+}
+namespace StaticRecompNativeClock
+{
+class NativeClock;
+}
+namespace StaticRecompNativePi
+{
+class NativePi;
+}
+namespace StaticRecompNativeExi
+{
+class NativeExi;
+}
+namespace StaticRecompState
+{
+class StateStream;
+}
+
+class StaticRecompCore : public JitBase, public StaticRecompCpuHost::CpuHost
 {
 public:
   friend class StaticRecompLockstep::StaticRecompLockstepVerifier;
@@ -70,6 +100,24 @@ public:
 
   void ClearCache() override;
   void DoExtraState(PointerWrap& p, bool present) override;
+  void DoNativeState(StaticRecompState::StateStream& p, bool present) override;  // the native sections
+  void SeedNativeDevicesForNativeState() override;  // phase S: before writing a native checkpoint
+  // Phase S: the data BAT table of the native layer (built from the game's DBAT
+  // registers); rebuilt by the kernel on BAT/HID4 writes and after state loads.
+  void UpdateNativeBats() override;
+  u32 Dbat(u32 ea) const override { return m_native_dbat.Entry(ea); }
+  // The authoritative SPR array (phase S): the port's while the guest runs,
+  // the chassis's mirror while the chassis acts.
+  u32* Sprs();
+  int& Downcount();           // the slice counter (authoritative copy)
+  u32& PendingExceptions();   // the pending lines (authoritative copy)
+  // Lines the chassis raised on its mirror while the guest had the authority
+  // (its MMU hooks): moved into the port's copy.
+  void FoldChassisExceptions();
+  // The chassis's CheckExceptions on the module's state; false when nothing
+  // synchronous is pending.
+  bool DeliverSynchronousException();
+  const u32* Sprs() const { return const_cast<StaticRecompCore*>(this)->Sprs(); }
   void Jit(u32 em_address) override {}
   bool HandleFault(uintptr_t access_address, SContext* ctx) override { return false; }
 
@@ -110,22 +158,9 @@ private:
 
   void LoadModule();
 
-  // D4 SMC guard, verify-on-entry model. Every chunk starts Unverified; the
-  // first native dispatch into it hashes its guest RAM against the module's
-  // recorded hash of the original text. An icache invalidation touching a
-  // chunk resets it to Unverified (Dolphin invalidates while *loading* code,
-  // so invalidation alone must not retire coverage); a hash mismatch (real
-  // SMC) marks it Failed, interpreter-only until the next invalidation.
-  enum ChunkState : u8
-  {
-    CHUNK_UNVERIFIED = 0,
-    CHUNK_VERIFIED = 1,
-    CHUNK_FAILED = 2,
-  };
-
+  // The D4 SMC guard (StaticRecompCodeGuard); the chassis's icache
+  // invalidations reach it through the block cache above.
   void OnICacheInvalidate(u32 address, u32 length, u32 physical_address);
-  int ChunkIndexOf(u32 address) const;
-  void VerifyChunk(u32 index);
 
   static void SetPPCStateFromGuestState(const CPUState& s, PowerPC::PowerPCState& ppc);
 
@@ -133,6 +168,24 @@ private:
   // full sync at every native-burst boundary.
   void SyncIn();   // Dolphin PowerPCState -> m_guest
   void SyncOut();  // m_guest -> Dolphin PowerPCState
+  // Phase S: the module's CPUState is the CPU state while the core runs; the
+  // chassis's PowerPCState is a mirror refreshed only where the chassis acts
+  // (interpreter fallback, its exception delivery, savestates, Run() entry
+  // and exit). EnterGuest() before native code, EnterChassis() before a
+  // chassis path; both are no-ops when the authority already matches.
+  enum class StateAuthority : u8
+  {
+    Chassis,
+    Guest,
+  };
+  void EnterGuest();
+  void EnterChassis();
+  StateAuthority m_authority = StateAuthority::Chassis;
+  bool m_sync_every_burst = false;  // lockstep, chassis exception delivery or MODERNGEKKO_NATIVE_SYNC_EVERY_BURST
+  u64 m_sync_in = 0;
+  u64 m_sync_out = 0;
+  bool m_native_sync_exceptions = true;  // MODERNGEKKO_NATIVE_SYNC_EXCEPTIONS=off: the chassis delivers
+  u64 m_native_sync_exceptions_delivered = 0;
 
   // CPUState hooks (module -> chassis environment). `cpu->external_user_data`
   // is the StaticRecompCore*.
@@ -152,18 +205,22 @@ private:
   void RefreshDispatchBudget(CPUState& cpu);
 
   std::unique_ptr<StaticRecompLockstep::StaticRecompLockstepVerifier> m_lockstep_verifier;
-  // Host implementations of SDK functions (modules built with native hooks).
-  std::unique_ptr<StaticRecompNativeSdk::NativeSdk> m_native_sdk;
+  // The port's devices and their register dispatch (phase L1).
+  StaticRecompMachine::Machine m_machine;
 
   EmptyBlockCache m_block_cache{*this};
+  StaticRecompNativeBat::NativeBat m_native_dbat;
 
   CPUState m_guest{};
-  Common::DynamicLibrary m_library;
+  StaticRecompGuestRegs::GuestRegs m_regs{};  // phase S: SPRs outside CPUState
+  StaticRecompModuleLoader::ModuleLibrary m_library;
   StaticRecompModuleSource m_module_source;
   const StaticRecompModuleDesc* m_module = nullptr;
   bool m_module_active = false;
   std::unique_ptr<JitBase> m_fallback_jit;
 
+  bool m_boot_dumped = false;  // MODERNGEKKO_BOOT_DUMP written (phase G diagnostic)
+  bool m_state_converted = false;  // MODERNGEKKO_CONVERT_STATE written (phase S)
   u64 m_native_dispatches = 0;
   u64 m_fallback_steps = 0;
   u64 m_fallback_jit_runs = 0;
@@ -188,25 +245,12 @@ private:
   u64 m_native_decrementer_writes = 0;
   u64 m_native_dma_register_instructions = 0;
   u64 m_native_system_register_instructions = 0;
+  u64 m_native_physical_accesses = 0;  // real-mode RAM accesses served without the chassis MMU
   u64 m_bursts = 0;          // SyncIn..SyncOut native runs (diagnostic)
   u64 m_charged_cycles = 0;  // cycles flushed from module charges (diagnostic)
 
-  // D4 guard state: parallel to m_module->chunk_ranges.
-  std::vector<u8> m_chunk_state;
-  u32 m_failed_chunks = 0;    // chunks currently failing verification (real SMC)
-  u64 m_verifications = 0;    // chunk hash checks performed
-  u64 m_reverify_events = 0;  // invalidations that reset a chunk to Unverified
+  StaticRecompCodeGuard::CodeGuard m_code_guard;  // D4: per-chunk verification state
 
-  // Lookup table optimization for O(1) chunk searches
-  std::vector<int> m_chunk_lookup_table;
-  u32 m_lookup_ram_size = 0;
-  u32 m_lookup_exram_size = 0;
-  int GetAddressLookupIndex(u32 address) const;
-  void InitLookupTable(u32 ram_size, u32 exram_size);
-
-  // Dispatch locality: most control transfers stay inside one chunk, so the
-  // last hit short-circuits the chunk binary search on the hot path.
-  mutable u32 m_last_chunk_index = 0;
 
   u32 m_idle_pc = 0;
 };
